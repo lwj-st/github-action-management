@@ -26,9 +26,10 @@ jobs:
     steps:
       - name: 解析仓库列表
         run: |
+          echo "处理仓库列表:"
           echo "${{ github.event.inputs.repos }}" | while read -r repo; do
             if [ -n "$repo" ]; then
-              echo "检查仓库：$repo"
+              echo "  - 检查仓库：$repo"
             fi
           done
       
@@ -49,14 +50,12 @@ jobs:
       - name: 生成批处理报告
         run: |
           mkdir -p batch-results
-          cat > batch-results/report.txt << EOF
-批量操作报告
-============
-时间：$(date -Iseconds)
-操作类型：${{ github.event.inputs.operation }}
-仓库数量：$(echo "${{ github.event.inputs.repos }}" | grep -c '.')
-状态：✅ 完成
-EOF
+          echo "批量操作报告" > batch-results/report.txt
+          echo "============" >> batch-results/report.txt
+          echo "时间：$(date -Iseconds)" >> batch-results/report.txt
+          echo "操作类型：${{ github.event.inputs.operation }}" >> batch-results/report.txt
+          echo "仓库数量：$(echo "${{ github.event.inputs.repos }}" | grep -c '.' 2>/dev/null || echo 1)" >> batch-results/report.txt
+          echo "状态：✅ 完成" >> batch-results/report.txt
           cat batch-results/report.txt
       
       - name: 上传批处理结果

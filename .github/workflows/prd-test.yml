@@ -20,11 +20,11 @@ on:
         description: '模拟失败？'
         required: false
         type: boolean
-        default: false
+        default: 'false'
       retry_count:
         description: '重试次数'
         required: false
-        type: number
+        type: string
         default: '1'
 
 jobs:
