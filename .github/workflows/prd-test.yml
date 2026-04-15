@@ -1,0 +1,120 @@
+# 测试 PRD 功能的 Workflow
+name: PRD Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: '测试消息（必填）'
+        required: true
+        type: string
+      environment:
+        description: '测试环境'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      should_fail:
+        description: '模拟失败？'
+        required: false
+        type: boolean
+        default: false
+      retry_count:
+        description: '重试次数'
+        required: false
+        type: number
+        default: '1'
+
+jobs:
+  test-prd:
+    name: 测试 PRD 功能
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 显示输入参数
+        run: |
+          echo "消息：${{ github.event.inputs.message }}"
+          echo "环境：${{ github.event.inputs.environment }}"
+          echo "模拟失败：${{ github.event.inputs.should_fail }}"
+          echo "重试次数：${{ github.event.inputs.retry_count }}"
+      
+      - name: 验证必填参数
+        run: |
+          if [ -z "${{ github.event.inputs.message }}" ]; then
+            echo "错误：message 参数不能为空"
+            exit 1
+          fi
+      
+      - name: 环境验证
+        run: |
+          case "${{ github.event.inputs.environment }}" in
+            dev|staging|prod)
+              echo "有效环境：${{ github.event.inputs.environment }}"
+              ;;
+            *)
+              echo "错误：无效的环境值"
+              exit 1
+              ;;
+          esac
+      
+      - name: 模拟失败测试
+        if: ${{ github.event.inputs.should_fail == 'true' }}
+        run: |
+          echo "模拟失败..."
+          exit 1
+      
+      - name: 创建测试制品
+        run: |
+          mkdir -p test-artifacts
+          echo "测试通过！" > test-artifacts/test-result.txt
+          echo "环境：${{ github.event.inputs.environment }}" >> test-artifacts/test-result.txt
+          echo "时间：$(date -Iseconds)" >> test-artifacts/test-result.txt
+          echo "PRD 测试完成！" >> test-artifacts/test-result.txt
+      
+      - name: 上传制品
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts
+          path: test-artifacts/
+          retention-days: 7
+      
+      - name: 输出到 Summary
+        run: |
+          echo "## PRD 测试结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 消息 | ${{ github.event.inputs.message }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 环境 | ${{ github.event.inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 状态 | ✅ 成功 |" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 设置输出
+        run: |
+          echo "test_status=success" >> $GITHUB_OUTPUT
+          echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+      
+  verify:
+    name: 验证测试
+    runs-on: ubuntu-latest
+    needs: test-prd
+    if: always()
+    
+    steps:
+      - name: 检查测试状态
+        run: |
+          if [ "${{ needs.test-prd.result }}" == "success" ]; then
+            echo "✅ PRD 测试全部通过"
+            exit 0
+          elif [ "${{ needs.test-prd.result }}" == "failure" ]; then
+            echo "❌ PRD 测试失败"
+            exit 1
+          else
+            echo "⚠️ PRD 测试被取消"
+            exit 0
+          fi

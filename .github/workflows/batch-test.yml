@@ -1,0 +1,66 @@
+# 批量操作测试
+name: Batch Operations Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: '仓库列表（每行一个）'
+        required: true
+        type: string
+        default: |
+          lwj-st/github-action-management
+      operation:
+        description: '操作类型'
+        required: true
+        type: choice
+        options:
+          - check
+          - deploy
+          - test
+
+jobs:
+  batch-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 解析仓库列表
+        run: |
+          echo "${{ github.event.inputs.repos }}" | while read -r repo; do
+            if [ -n "$repo" ]; then
+              echo "检查仓库：$repo"
+            fi
+          done
+      
+      - name: 批量操作模拟
+        run: |
+          case "${{ github.event.inputs.operation }}" in
+            check)
+              echo "执行检查操作..."
+              ;;
+            deploy)
+              echo "执行部署操作..."
+              ;;
+            test)
+              echo "执行测试操作..."
+              ;;
+          esac
+      
+      - name: 生成批处理报告
+        run: |
+          mkdir -p batch-results
+          cat > batch-results/report.txt << EOF
+批量操作报告
+============
+时间：$(date -Iseconds)
+操作类型：${{ github.event.inputs.operation }}
+仓库数量：$(echo "${{ github.event.inputs.repos }}" | grep -c '.')
+状态：✅ 完成
+EOF
+          cat batch-results/report.txt
+      
+      - name: 上传批处理结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-results
+          path: batch-results/
