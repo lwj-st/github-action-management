@@ -12,7 +12,7 @@ const tauriBin = path.join(
 const result = spawnSync(tauriBin, process.argv.slice(2), {
   cwd: path.join(repoRoot, 'src-tauri'),
   stdio: 'inherit',
-  shell: false,
+  shell: process.platform === 'win32',
 })
 
 if (result.error) {
