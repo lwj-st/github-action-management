@@ -1,76 +1,166 @@
 mod github_client;
 mod models;
+mod storage;
 
-use github_client::GitHubClient;
+use chrono::Utc;
+use github_client::{flatten_logs, summarize_run, GitHubClient};
 use models::*;
-use serde::{Deserialize, Serialize};
-use tauri::Manager;
-use std::sync::Arc;
+use serde_json::Value;
+use std::fs;
+use storage::{
+    append_audit_entry, delete_token, downloads_dir, load_state, read_token, save_state, store_token,
+    token_status,
+};
 
-#[derive(Debug, Serialize, Deserialize)]
-struct AppData {
-    context: Arc<AppContext>,
+fn split_repo(repo_full_name: &str) -> Result<(&str, &str), String> {
+    let parts: Vec<&str> = repo_full_name.split('/').collect();
+    if parts.len() != 2 {
+        return Err("Repository must be in owner/repo format".to_string());
+    }
+    Ok((parts[0], parts[1]))
 }
 
-// ============ 账户管理 ============
+fn account_token(state: &StoredState, account_id: &str) -> Result<String, String> {
+    if state.accounts.iter().any(|item| item.id == account_id) {
+        read_token(account_id)
+    } else {
+        Err("Account not found".to_string())
+    }
+}
+
+fn to_account_summary(account: &AccountRecord) -> AccountSummary {
+    AccountSummary {
+        id: account.id.clone(),
+        name: account.name.clone(),
+        created_at: account.created_at.clone(),
+        last_used_at: account.last_used_at.clone(),
+        token_status: token_status(account),
+    }
+}
+
+async fn build_run_bundle(
+    token: &str,
+    repo_full_name: &str,
+    run_id: i64,
+    audit_entries: Vec<AuditEntry>,
+) -> Result<RunBundle, String> {
+    let client = GitHubClient::new(token)?;
+    let (owner, repo) = split_repo(repo_full_name)?;
+    let run = client.get_run(owner, repo, run_id).await?;
+    let jobs = client.get_jobs(owner, repo, run_id).await?;
+    let artifacts = client.get_artifacts(owner, repo, run_id).await?;
+
+    let mut collected_logs = Vec::new();
+    for job in &jobs {
+        if let Ok(logs) = client.get_job_logs(owner, repo, job.id).await {
+            collected_logs.push((job.id, logs));
+        }
+    }
+
+    let log_text = flatten_logs(&jobs, &collected_logs);
+    let summary_lines = summarize_run(&run, &jobs, &artifacts);
+
+    Ok(RunBundle {
+        run,
+        jobs,
+        artifacts,
+        log_text,
+        summary_lines,
+        audit_entries,
+    })
+}
 
 #[tauri::command]
-fn add_account(context: tauri::State<'_, AppContext>, name: String, token: String) -> Result<Account, String> {
-    let mut state = context.state.lock().map_err(|e| e.to_string())?;
+fn bootstrap_app(context: tauri::State<'_, AppContext>) -> Result<BootstrapData, String> {
+    let stored = load_state()?;
+    let accounts = stored.accounts.iter().map(to_account_summary).collect::<Vec<_>>();
 
-    let account = Account {
+    {
+        let mut state = context.state.lock().map_err(|err| err.to_string())?;
+        state.stored = stored.clone();
+    }
+
+    Ok(BootstrapData {
+        accounts,
+        selected_account_id: stored.selected_account_id.clone(),
+        selected_repo_full_name: stored.selected_repo_full_name.clone(),
+        audit_entries: stored.audit_entries.clone(),
+    })
+}
+
+#[tauri::command]
+async fn add_account(
+    context: tauri::State<'_, AppContext>,
+    name: String,
+    token: String,
+) -> Result<AccountSummary, String> {
+    let client = GitHubClient::new(&token)?;
+    client.validate_token().await?;
+
+    let now = Utc::now().to_rfc3339();
+    let account = AccountRecord {
         id: uuid::Uuid::new_v4().to_string(),
         name,
-        token, // 实际应用中应该加密
-        created_at: chrono::Utc::now().to_rfc3339(),
+        created_at: now.clone(),
+        last_used_at: Some(now),
     };
+    store_token(&account.id, &token)?;
 
-    state.accounts.push(account.clone());
-    Ok(account)
-}
+    {
+        let mut state = context.state.lock().map_err(|err| err.to_string())?;
+        state.stored.accounts.push(account.clone());
+        state.stored.selected_account_id = Some(account.id.clone());
+        append_audit_entry(
+            &mut state.stored,
+            "account.added",
+            "Added GitHub account",
+            Some(account.id.clone()),
+            None,
+            None,
+        );
+        save_state(&state.stored)?;
+    }
 
-#[tauri::command]
-fn get_accounts(context: tauri::State<'_, AppContext>) -> Result<Vec<Account>, String> {
-    let state = context.state.lock().map_err(|e| e.to_string())?;
-    Ok(state.accounts.clone())
+    Ok(to_account_summary(&account))
 }
 
 #[tauri::command]
 fn remove_account(context: tauri::State<'_, AppContext>, account_id: String) -> Result<(), String> {
-    let mut state = context.state.lock().map_err(|e| e.to_string())?;
-    state.accounts.retain(|a| a.id != account_id);
+    {
+        let mut state = context.state.lock().map_err(|err| err.to_string())?;
+        state.stored.accounts.retain(|account| account.id != account_id);
+        if state.stored.selected_account_id.as_deref() == Some(&account_id) {
+            state.stored.selected_account_id = state.stored.accounts.first().map(|item| item.id.clone());
+            state.stored.selected_repo_full_name = None;
+        }
+        append_audit_entry(
+            &mut state.stored,
+            "account.removed",
+            "Removed GitHub account",
+            Some(account_id.clone()),
+            None,
+            None,
+        );
+        save_state(&state.stored)?;
+    }
+    delete_token(&account_id)?;
     Ok(())
+}
+
+#[tauri::command]
+fn get_accounts(context: tauri::State<'_, AppContext>) -> Result<Vec<AccountSummary>, String> {
+    let state = context.state.lock().map_err(|err| err.to_string())?;
+    Ok(state.stored.accounts.iter().map(to_account_summary).collect())
 }
 
 #[tauri::command]
 fn set_current_account(context: tauri::State<'_, AppContext>, account_id: String) -> Result<(), String> {
-    let mut state = context.state.lock().map_err(|e| e.to_string())?;
-    state.current_account = Some(account_id);
+    {
+        let mut state = context.state.lock().map_err(|err| err.to_string())?;
+        state.stored.selected_account_id = Some(account_id);
+        save_state(&state.stored)?;
+    }
     Ok(())
-}
-
-// ============ 仓库管理 ============
-
-#[tauri::command]
-async fn fetch_repositories(
-    app: tauri::AppHandle,
-    context: tauri::State<'_, AppContext>,
-    account_id: String,
-) -> Result<Vec<Repository>, String> {
-    let state = context.state.lock().map_err(|e| e.to_string())?;
-    let account = state
-        .accounts
-        .iter()
-        .find(|a| a.id == account_id)
-        .ok_or("Account not found")?;
-
-    let client = GitHubClient::new(account.token.clone());
-    let repos = client.get_repositories().await?;
-
-    let mut state = context.state.lock().map_err(|e| e.to_string())?;
-    state.repositories = repos.clone();
-
-    Ok(repos)
 }
 
 #[tauri::command]
@@ -78,12 +168,44 @@ fn set_selected_repository(
     context: tauri::State<'_, AppContext>,
     repo_full_name: String,
 ) -> Result<(), String> {
-    let mut state = context.state.lock().map_err(|e| e.to_string())?;
-    state.selected_repository = Some(repo_full_name);
+    {
+        let mut state = context.state.lock().map_err(|err| err.to_string())?;
+        state.stored.selected_repo_full_name = Some(repo_full_name);
+        save_state(&state.stored)?;
+    }
     Ok(())
 }
 
-// ============ Workflow 管理 ============
+#[tauri::command]
+async fn fetch_repositories(
+    context: tauri::State<'_, AppContext>,
+    account_id: String,
+) -> Result<Vec<Repository>, String> {
+    let token = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        account_token(&state.stored, &account_id)?
+    };
+    let client = GitHubClient::new(&token)?;
+    let repositories = client.get_repositories().await?;
+
+    {
+        let mut state = context.state.lock().map_err(|err| err.to_string())?;
+        if let Some(account) = state.stored.accounts.iter_mut().find(|item| item.id == account_id) {
+            account.last_used_at = Some(Utc::now().to_rfc3339());
+        }
+        append_audit_entry(
+            &mut state.stored,
+            "repo.fetch",
+            "Fetched repositories",
+            Some(account_id),
+            None,
+            None,
+        );
+        save_state(&state.stored)?;
+    }
+
+    Ok(repositories)
+}
 
 #[tauri::command]
 async fn fetch_workflows(
@@ -91,39 +213,26 @@ async fn fetch_workflows(
     account_id: String,
     repo_full_name: String,
 ) -> Result<Vec<WorkflowDetails>, String> {
-    let state = context.state.lock().map_err(|e| e.to_string())?;
-    let account = state
-        .accounts
-        .iter()
-        .find(|a| a.id == account_id)
-        .ok_or("Account not found")?;
-
-    let parts: Vec<&str> = repo_full_name.split('/').collect();
-    if parts.len() != 2 {
-        return Err("Invalid repository name format".to_string());
-    }
-
-    let (owner, repo) = (parts[0], parts[1]);
-    let client = GitHubClient::new(account.token.clone());
-
+    let token = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        account_token(&state.stored, &account_id)?
+    };
+    let client = GitHubClient::new(&token)?;
+    let (owner, repo) = split_repo(&repo_full_name)?;
     let workflows = client.get_workflows(owner, repo).await?;
 
-    // 获取每个 workflow 的 YAML 并解析输入参数
-    let mut workflow_details = Vec::new();
+    let default_branch = "main".to_string();
+    let mut detailed = Vec::new();
     for workflow in workflows {
-        let yaml_content = client.get_workflow_yaml(owner, repo, workflow.id).await?;
-        let inputs = GitHubClient::parse_workflow_inputs(&yaml_content)?;
-
-        workflow_details.push(WorkflowDetails {
-            workflow: workflow.clone(),
-            inputs,
-        });
+        let inputs = client
+            .get_workflow_inputs(owner, repo, &workflow.path, &default_branch)
+            .await
+            .unwrap_or_default();
+        detailed.push(WorkflowDetails { workflow, inputs });
     }
 
-    Ok(workflow_details)
+    Ok(detailed)
 }
-
-// ============ Workflow 运行管理 ============
 
 #[tauri::command]
 async fn trigger_workflow(
@@ -132,28 +241,40 @@ async fn trigger_workflow(
     repo_full_name: String,
     workflow_id: i64,
     ref_branch: String,
-    inputs: Option<serde_json::Value>,
-) -> Result<Run, String> {
-    let state = context.state.lock().map_err(|e| e.to_string())?;
-    let account = state
-        .accounts
-        .iter()
-        .find(|a| a.id == account_id)
-        .ok_or("Account not found")?;
-
-    let parts: Vec<&str> = repo_full_name.split('/').collect();
-    if parts.len() != 2 {
-        return Err("Invalid repository name format".to_string());
-    }
-
-    let (owner, repo) = (parts[0], parts[1]);
-    let client = GitHubClient::new(account.token.clone());
-
+    inputs: Option<Value>,
+) -> Result<TriggerResponse, String> {
+    let token = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        account_token(&state.stored, &account_id)?
+    };
+    let client = GitHubClient::new(&token)?;
+    let (owner, repo) = split_repo(&repo_full_name)?;
     let run = client
-        .trigger_workflow(owner, repo, workflow_id, &ref_branch, inputs.as_ref())
+        .trigger_workflow(owner, repo, workflow_id, &ref_branch, inputs)
         .await?;
 
-    Ok(run)
+    {
+        let mut state = context.state.lock().map_err(|err| err.to_string())?;
+        append_audit_entry(
+            &mut state.stored,
+            "workflow.trigger",
+            "Triggered workflow_dispatch",
+            Some(account_id),
+            Some(repo_full_name),
+            run.as_ref().map(|item| item.id),
+        );
+        save_state(&state.stored)?;
+    }
+
+    Ok(TriggerResponse {
+        accepted: true,
+        message: if run.is_some() {
+            "Workflow dispatch accepted".to_string()
+        } else {
+            "Workflow dispatched; run not observed yet".to_string()
+        },
+        run,
+    })
 }
 
 #[tauri::command]
@@ -166,29 +287,40 @@ async fn fetch_runs(
     status: Option<String>,
     limit: i32,
 ) -> Result<Vec<Run>, String> {
-    let state = context.state.lock().map_err(|e| e.to_string())?;
-    let account = state
-        .accounts
-        .iter()
-        .find(|a| a.id == account_id)
-        .ok_or("Account not found")?;
-
-    let parts: Vec<&str> = repo_full_name.split('/').collect();
-    if parts.len() != 2 {
-        return Err("Invalid repository name format".to_string());
-    }
-
-    let (owner, repo) = (parts[0], parts[1]);
-    let client = GitHubClient::new(account.token.clone());
-
-    let runs = client
+    let token = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        account_token(&state.stored, &account_id)?
+    };
+    let client = GitHubClient::new(&token)?;
+    let (owner, repo) = split_repo(&repo_full_name)?;
+    client
         .get_runs(owner, repo, workflow_id, branch.as_deref(), status.as_deref(), limit)
-        .await?;
+        .await
+}
 
-    let mut state = context.state.lock().map_err(|e| e.to_string())?;
-    state.runs = runs.clone();
+#[tauri::command]
+async fn get_run_bundle(
+    context: tauri::State<'_, AppContext>,
+    account_id: String,
+    repo_full_name: String,
+    run_id: i64,
+) -> Result<RunBundle, String> {
+    let token = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        account_token(&state.stored, &account_id)?
+    };
+    let audit_entries = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        state
+            .stored
+            .audit_entries
+            .iter()
+            .filter(|entry| entry.run_id == Some(run_id))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
 
-    Ok(runs)
+    build_run_bundle(&token, &repo_full_name, run_id, audit_entries).await
 }
 
 #[tauri::command]
@@ -198,22 +330,26 @@ async fn cancel_run(
     repo_full_name: String,
     run_id: i64,
 ) -> Result<(), String> {
-    let state = context.state.lock().map_err(|e| e.to_string())?;
-    let account = state
-        .accounts
-        .iter()
-        .find(|a| a.id == account_id)
-        .ok_or("Account not found")?;
-
-    let parts: Vec<&str> = repo_full_name.split('/').collect();
-    if parts.len() != 2 {
-        return Err("Invalid repository name format".to_string());
-    }
-
-    let (owner, repo) = (parts[0], parts[1]);
-    let client = GitHubClient::new(account.token.clone());
-
+    let token = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        account_token(&state.stored, &account_id)?
+    };
+    let client = GitHubClient::new(&token)?;
+    let (owner, repo) = split_repo(&repo_full_name)?;
     client.cancel_run(owner, repo, run_id).await?;
+
+    {
+        let mut state = context.state.lock().map_err(|err| err.to_string())?;
+        append_audit_entry(
+            &mut state.stored,
+            "run.cancel",
+            "Cancelled workflow run",
+            Some(account_id),
+            Some(repo_full_name),
+            Some(run_id),
+        );
+        save_state(&state.stored)?;
+    }
 
     Ok(())
 }
@@ -225,22 +361,26 @@ async fn rerun_run(
     repo_full_name: String,
     run_id: i64,
 ) -> Result<(), String> {
-    let state = context.state.lock().map_err(|e| e.to_string())?;
-    let account = state
-        .accounts
-        .iter()
-        .find(|a| a.id == account_id)
-        .ok_or("Account not found")?;
-
-    let parts: Vec<&str> = repo_full_name.split('/').collect();
-    if parts.len() != 2 {
-        return Err("Invalid repository name format".to_string());
-    }
-
-    let (owner, repo) = (parts[0], parts[1]);
-    let client = GitHubClient::new(account.token.clone());
-
+    let token = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        account_token(&state.stored, &account_id)?
+    };
+    let client = GitHubClient::new(&token)?;
+    let (owner, repo) = split_repo(&repo_full_name)?;
     client.rerun_run(owner, repo, run_id).await?;
+
+    {
+        let mut state = context.state.lock().map_err(|err| err.to_string())?;
+        append_audit_entry(
+            &mut state.stored,
+            "run.rerun",
+            "Requested rerun for workflow run",
+            Some(account_id),
+            Some(repo_full_name),
+            Some(run_id),
+        );
+        save_state(&state.stored)?;
+    }
 
     Ok(())
 }
@@ -252,109 +392,166 @@ async fn rerun_failed_jobs(
     repo_full_name: String,
     run_id: i64,
 ) -> Result<(), String> {
-    let state = context.state.lock().map_err(|e| e.to_string())?;
-    let account = state
-        .accounts
-        .iter()
-        .find(|a| a.id == account_id)
-        .ok_or("Account not found")?;
-
-    let parts: Vec<&str> = repo_full_name.split('/').collect();
-    if parts.len() != 2 {
-        return Err("Invalid repository name format".to_string());
-    }
-
-    let (owner, repo) = (parts[0], parts[1]);
-    let client = GitHubClient::new(account.token.clone());
-
+    let token = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        account_token(&state.stored, &account_id)?
+    };
+    let client = GitHubClient::new(&token)?;
+    let (owner, repo) = split_repo(&repo_full_name)?;
     client.rerun_failed_jobs(owner, repo, run_id).await?;
+
+    {
+        let mut state = context.state.lock().map_err(|err| err.to_string())?;
+        append_audit_entry(
+            &mut state.stored,
+            "run.rerun_failed_jobs",
+            "Requested rerun for failed jobs",
+            Some(account_id),
+            Some(repo_full_name),
+            Some(run_id),
+        );
+        save_state(&state.stored)?;
+    }
 
     Ok(())
 }
 
 #[tauri::command]
-async fn get_run_details(
+async fn download_artifact(
+    context: tauri::State<'_, AppContext>,
+    account_id: String,
+    repo_full_name: String,
+    artifact_id: i64,
+    artifact_name: String,
+) -> Result<DownloadResponse, String> {
+    let token = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        account_token(&state.stored, &account_id)?
+    };
+    let client = GitHubClient::new(&token)?;
+    let (owner, repo) = split_repo(&repo_full_name)?;
+    let bytes = client.download_artifact_bytes(owner, repo, artifact_id).await?;
+
+    let dir = downloads_dir().join(format!("{}_{}", owner, repo));
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let safe_name = artifact_name.replace('/', "-");
+    let path = dir.join(format!("{safe_name}-{artifact_id}.zip"));
+    fs::write(&path, bytes).map_err(|err| err.to_string())?;
+
+    {
+        let mut state = context.state.lock().map_err(|err| err.to_string())?;
+        append_audit_entry(
+            &mut state.stored,
+            "artifact.download",
+            "Downloaded workflow artifact",
+            Some(account_id),
+            Some(repo_full_name),
+            None,
+        );
+        save_state(&state.stored)?;
+    }
+
+    Ok(DownloadResponse {
+        path: path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+async fn export_run_report(
     context: tauri::State<'_, AppContext>,
     account_id: String,
     repo_full_name: String,
     run_id: i64,
-) -> Result<Run, String> {
-    let state = context.state.lock().map_err(|e| e.to_string())?;
-    let account = state
-        .accounts
-        .iter()
-        .find(|a| a.id == account_id)
-        .ok_or("Account not found")?;
+    format: String,
+) -> Result<ExportResponse, String> {
+    let token = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        account_token(&state.stored, &account_id)?
+    };
+    let audit_entries = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        state
+            .stored
+            .audit_entries
+            .iter()
+            .filter(|entry| entry.run_id == Some(run_id))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let bundle = build_run_bundle(&token, &repo_full_name, run_id, audit_entries).await?;
+    let dir = downloads_dir().join("reports");
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
 
-    let parts: Vec<&str> = repo_full_name.split('/').collect();
-    if parts.len() != 2 {
-        return Err("Invalid repository name format".to_string());
-    }
+    let path = match format.as_str() {
+        "json" => {
+            let path = dir.join(format!("run-{run_id}.json"));
+            let content = serde_json::to_string_pretty(&bundle).map_err(|err| err.to_string())?;
+            fs::write(&path, content).map_err(|err| err.to_string())?;
+            path
+        }
+        _ => {
+            let path = dir.join(format!("run-{run_id}.md"));
+            let mut markdown = String::new();
+            markdown.push_str(&format!("# Workflow Run Report #{run_id}\n\n"));
+            markdown.push_str(&format!("- Repository: `{repo_full_name}`\n"));
+            markdown.push_str(&format!("- Status: `{}`\n", bundle.run.status));
+            markdown.push_str(&format!(
+                "- Conclusion: `{}`\n\n",
+                bundle.run.conclusion.clone().unwrap_or_else(|| "n/a".to_string())
+            ));
+            markdown.push_str("## Summary\n");
+            for line in &bundle.summary_lines {
+                markdown.push_str(&format!("- {line}\n"));
+            }
+            markdown.push_str("\n## Jobs\n");
+            for job in &bundle.jobs {
+                markdown.push_str(&format!(
+                    "- `{}` status=`{}` conclusion=`{}`\n",
+                    job.name,
+                    job.status,
+                    job.conclusion.clone().unwrap_or_else(|| "n/a".to_string())
+                ));
+            }
+            markdown.push_str("\n## Artifacts\n");
+            for artifact in &bundle.artifacts {
+                markdown.push_str(&format!(
+                    "- `{}` ({} bytes)\n",
+                    artifact.name, artifact.size_in_bytes
+                ));
+            }
+            markdown.push_str("\n## Logs\n\n```text\n");
+            markdown.push_str(&bundle.log_text);
+            markdown.push_str("\n```\n");
+            fs::write(&path, markdown).map_err(|err| err.to_string())?;
+            path
+        }
+    };
 
-    let (owner, repo) = (parts[0], parts[1]);
-    let client = GitHubClient::new(account.token.clone());
-
-    let run = client.get_run(owner, repo, run_id).await?;
-
-    Ok(run)
-}
-
-#[tauri::command]
-async fn get_artifacts(
-    context: tauri::State<'_, AppContext>,
-    account_id: String,
-    repo_full_name: String,
-    run_id: i64,
-) -> Result<Vec<Artifact>, String> {
-    let state = context.state.lock().map_err(|e| e.to_string())?;
-    let account = state
-        .accounts
-        .iter()
-        .find(|a| a.id == account_id)
-        .ok_or("Account not found")?;
-
-    let parts: Vec<&str> = repo_full_name.split('/').collect();
-    if parts.len() != 2 {
-        return Err("Invalid repository name format".to_string());
-    }
-
-    let (owner, repo) = (parts[0], parts[1]);
-    let client = GitHubClient::new(account.token.clone());
-
-    let artifacts = client.get_artifacts(owner, repo, run_id).await?;
-
-    Ok(artifacts)
-}
-
-// ============ 状态获取 ============
-
-#[tauri::command]
-fn get_app_state(context: tauri::State<'_, AppContext>) -> Result<AppState, String> {
-    let state = context.state.lock().map_err(|e| e.to_string())?;
-    Ok(state.clone())
+    Ok(ExportResponse {
+        path: path.to_string_lossy().to_string(),
+    })
 }
 
 fn main() {
     tauri::Builder::default()
-        .manage(AppData {
-            context: Arc::new(AppContext::new()),
-        })
+        .manage(AppContext::new())
         .invoke_handler(tauri::generate_handler![
+            bootstrap_app,
             add_account,
-            get_accounts,
             remove_account,
+            get_accounts,
             set_current_account,
-            fetch_repositories,
             set_selected_repository,
+            fetch_repositories,
             fetch_workflows,
             trigger_workflow,
             fetch_runs,
+            get_run_bundle,
             cancel_run,
             rerun_run,
             rerun_failed_jobs,
-            get_run_details,
-            get_artifacts,
-            get_app_state
+            download_artifact,
+            export_run_report
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
