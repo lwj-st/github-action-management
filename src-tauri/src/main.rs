@@ -212,6 +212,7 @@ async fn fetch_workflows(
     context: tauri::State<'_, AppContext>,
     account_id: String,
     repo_full_name: String,
+    reference: Option<String>,
 ) -> Result<Vec<WorkflowDetails>, String> {
     let token = {
         let state = context.state.lock().map_err(|err| err.to_string())?;
@@ -221,11 +222,14 @@ async fn fetch_workflows(
     let (owner, repo) = split_repo(&repo_full_name)?;
     let workflows = client.get_workflows(owner, repo).await?;
 
-    let default_branch = "main".to_string();
+    let workflow_reference = reference
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "main".to_string());
     let mut detailed = Vec::new();
     for workflow in workflows {
         let inputs = client
-            .get_workflow_inputs(owner, repo, &workflow.path, &default_branch)
+            .get_workflow_inputs(owner, repo, &workflow.path, &workflow_reference)
             .await
             .unwrap_or_default();
         detailed.push(WorkflowDetails { workflow, inputs });

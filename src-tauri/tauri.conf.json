@@ -20,6 +20,10 @@
     "bundle": {
       "active": true,
       "identifier": "com.lwjst.github-action-management",
+      "icon": [
+        "icons/icon.png",
+        "icons/icon.ico"
+      ],
       "targets": "app"
     },
     "security": {

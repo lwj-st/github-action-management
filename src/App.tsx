@@ -267,12 +267,16 @@ function App() {
     void loadRepositories(selectedAccountId)
   }, [selectedAccountId])
 
-  async function loadRepoData(accountId: string, repoFullName: string) {
+  async function loadRepoData(accountId: string, repoFullName: string, reference?: string) {
     setLoadingLabel('同步 workflow 与运行记录')
     setError('')
     try {
       const [nextWorkflows, nextRuns] = await Promise.all([
-        safeInvoke<WorkflowDetails[]>('fetch_workflows', { accountId, repoFullName }),
+        safeInvoke<WorkflowDetails[]>('fetch_workflows', {
+          accountId,
+          repoFullName,
+          reference,
+        }),
         safeInvoke<Run[]>('fetch_runs', { accountId, repoFullName, limit: 40 }),
       ])
       setWorkflows(nextWorkflows)
@@ -297,9 +301,10 @@ function App() {
       setRunBundle(null)
       return
     }
+    const selectedRepo = repositories.find((repo) => repo.full_name === selectedRepoFullName)
     void safeInvoke('set_selected_repository', { repoFullName: selectedRepoFullName }).catch(() => undefined)
-    void loadRepoData(selectedAccountId, selectedRepoFullName)
-  }, [selectedAccountId, selectedRepoFullName])
+    void loadRepoData(selectedAccountId, selectedRepoFullName, selectedRepo?.default_branch)
+  }, [repositories, selectedAccountId, selectedRepoFullName])
 
   useEffect(() => {
     if (!selectedAccountId || !selectedRepoFullName || !selectedRunId) {
