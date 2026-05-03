@@ -9,11 +9,11 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "preview": "vite preview",
-    "tauri": "cd src-tauri && ../node_modules/.bin/tauri --config tauri.conf.json",
-    "tauri:dev": "cd src-tauri && ../node_modules/.bin/tauri dev --config tauri.conf.json",
-    "tauri:build": "cd src-tauri && ../node_modules/.bin/tauri build --config tauri.conf.json",
-    "tauri:build:mac": "cd src-tauri && ../node_modules/.bin/tauri build --config tauri.conf.json --bundles app",
-    "tauri:build:windows": "cd src-tauri && ../node_modules/.bin/tauri build --config tauri.conf.json --bundles nsis"
+    "tauri": "node scripts/run-tauri.cjs --config tauri.conf.json",
+    "tauri:dev": "node scripts/run-tauri.cjs dev --config tauri.conf.json",
+    "tauri:build": "node scripts/run-tauri.cjs build --config tauri.conf.json",
+    "tauri:build:mac": "node scripts/run-tauri.cjs build --config tauri.conf.json --bundles app",
+    "tauri:build:windows": "node scripts/run-tauri.cjs build --config tauri.conf.json --bundles nsis"
   },
   "dependencies": {
     "@tauri-apps/api": "^1.5.0",
