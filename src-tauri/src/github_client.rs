@@ -1,10 +1,13 @@
-use crate::models::{Artifact, Branch, Job, JobSummary, Repository, Run, Step, Workflow, WorkflowInput};
+use crate::models::{Artifact, Branch, Job, Repository, Run, Step, Workflow, WorkflowInput};
 use base64::Engine;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use serde_yaml::{Mapping, Value as YamlValue};
+use std::collections::{HashMap, HashSet};
+use std::io::{Cursor, Read};
 use tokio::time::{sleep, Duration};
+use zip::ZipArchive;
 
 const API_BASE: &str = "https://api.github.com";
 
@@ -34,29 +37,15 @@ struct BranchListItem {
 }
 
 #[derive(Debug, Deserialize)]
-struct CheckRunsResponse {
-    check_runs: Vec<CheckRun>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CheckRun {
-    id: i64,
-    name: String,
-    conclusion: Option<String>,
-    details_url: Option<String>,
-    output: CheckRunOutput,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct CheckRunOutput {
-    summary: Option<String>,
-    text: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ContentResponse {
     content: String,
     encoding: String,
+}
+
+#[derive(Debug, Clone)]
+struct ArchivedLogFile {
+    path: String,
+    text: String,
 }
 
 pub struct GitHubClient {
@@ -122,15 +111,16 @@ impl GitHubClient {
         self.send_unit(self.client.get(format!("{API_BASE}/user"))).await
     }
 
-    pub async fn get_repositories(&self) -> Result<Vec<Repository>, String> {
+    pub async fn get_repositories(&self, all_accessible: bool) -> Result<Vec<Repository>, String> {
         let mut page = 1;
         let mut repositories = Vec::new();
+        let repo_type = if all_accessible { "all" } else { "owner" };
 
         loop {
             let page_result: Vec<Repository> = self
                 .send_json(
                     self.client.get(format!(
-                        "{API_BASE}/user/repos?per_page=100&page={page}&sort=updated&type=all"
+                        "{API_BASE}/user/repos?per_page=100&page={page}&sort=updated&type={repo_type}"
                     )),
                 )
                 .await?;
@@ -395,6 +385,50 @@ impl GitHubClient {
         response.text().await.map_err(|err| err.to_string())
     }
 
+    pub async fn collect_logs_for_run(
+        &self,
+        owner: &str,
+        repo: &str,
+        run: &Run,
+        jobs: &[Job],
+    ) -> Vec<(i64, String)> {
+        let mut direct_logs = HashMap::new();
+        let mut missing_jobs = Vec::new();
+
+        for job in jobs {
+            match self.get_job_logs(owner, repo, job.id).await {
+                Ok(logs) if !logs.trim().is_empty() => {
+                    direct_logs.insert(job.id, logs);
+                }
+                _ => missing_jobs.push(job),
+            }
+        }
+
+        let archive_logs = self
+            .get_run_logs_archive(owner, repo, run.id, run.run_attempt)
+            .await
+            .ok()
+            .unwrap_or_default();
+
+        let archive_matches = match_archived_logs_to_jobs(jobs, &archive_logs);
+
+        let mut merged = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let direct = direct_logs.get(&job.id).cloned();
+            let archive = archive_matches.get(&job.id).cloned();
+            let logs = choose_better_log(direct, archive);
+            if let Some(logs) = logs {
+                merged.push((job.id, logs));
+            }
+        }
+
+        if merged.is_empty() && !missing_jobs.is_empty() {
+            return Vec::new();
+        }
+
+        merged
+    }
+
     pub async fn get_artifacts(
         &self,
         owner: &str,
@@ -408,88 +442,6 @@ impl GitHubClient {
             )
             .await?;
         Ok(response.artifacts)
-    }
-
-    pub async fn get_job_summaries(
-        &self,
-        owner: &str,
-        repo: &str,
-        run_id: i64,
-        head_sha: &str,
-        job_names: &[String],
-        check_suite_id: Option<i64>,
-    ) -> Result<Vec<JobSummary>, String> {
-        let mut check_runs = Vec::new();
-
-        if let Some(check_suite_id) = check_suite_id {
-            let response: CheckRunsResponse = self
-                .send_json(
-                    self.client.get(format!(
-                        "{API_BASE}/repos/{owner}/{repo}/check-suites/{check_suite_id}/check-runs?per_page=100"
-                    )),
-                )
-                .await?;
-            check_runs.extend(response.check_runs);
-        }
-
-        if check_runs.is_empty() {
-            let response: CheckRunsResponse = self
-                .send_json(
-                    self.client.get(format!(
-                        "{API_BASE}/repos/{owner}/{repo}/commits/{head_sha}/check-runs?per_page=100&filter=latest"
-                    )),
-                )
-                .await?;
-            check_runs.extend(response.check_runs);
-        }
-
-        let summary_runs = check_runs
-            .into_iter()
-            .filter_map(|check_run| {
-                let summary = check_run.output.summary.unwrap_or_default().trim().to_string();
-                let text = check_run.output.text.and_then(|value| {
-                    let trimmed = value.trim().to_string();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed)
-                    }
-                });
-
-                if summary.is_empty() && text.is_none() {
-                    return None;
-                }
-
-                Some(JobSummary {
-                    id: check_run.id,
-                    name: check_run.name,
-                    conclusion: check_run.conclusion,
-                    summary,
-                    text,
-                    details_url: check_run.details_url,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let matched_runs = summary_runs
-            .iter()
-            .filter(|check_run| {
-                let matches_run_url = check_run
-                    .details_url
-                    .as_deref()
-                    .map(|url| url.contains(&format!("/actions/runs/{run_id}")))
-                    .unwrap_or(false);
-                let matches_job_name = job_names.iter().any(|job_name| job_name == &check_run.name);
-                matches_run_url || matches_job_name
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if matched_runs.is_empty() {
-            Ok(summary_runs)
-        } else {
-            Ok(matched_runs)
-        }
     }
 
     pub async fn cancel_run(&self, owner: &str, repo: &str, run_id: i64) -> Result<(), String> {
@@ -551,6 +503,32 @@ impl GitHubClient {
             .map(|value| value.to_vec())
             .map_err(|err| err.to_string())
     }
+
+    async fn get_run_logs_archive(
+        &self,
+        owner: &str,
+        repo: &str,
+        run_id: i64,
+        run_attempt: Option<i64>,
+    ) -> Result<Vec<ArchivedLogFile>, String> {
+        let url = if let Some(attempt) = run_attempt {
+            format!(
+                "{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt}/logs"
+            )
+        } else {
+            format!("{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/logs")
+        };
+
+        let response = self.client.get(url).send().await.map_err(|err| err.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("GitHub API error {status}: {body}"));
+        }
+
+        let bytes = response.bytes().await.map_err(|err| err.to_string())?;
+        parse_run_logs_archive(bytes.as_ref())
+    }
 }
 
 fn mapping_get<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a YamlValue> {
@@ -595,6 +573,126 @@ fn yaml_value_to_json(value: &YamlValue) -> Value {
     }
 }
 
+fn parse_run_logs_archive(bytes: &[u8]) -> Result<Vec<ArchivedLogFile>, String> {
+    let reader = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(reader).map_err(|err| err.to_string())?;
+    let mut files = Vec::new();
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|err| err.to_string())?;
+        if !entry.is_file() {
+            continue;
+        }
+
+        let path = entry.name().replace('\\', "/");
+        if !(path.ends_with(".txt") || path.ends_with(".log")) {
+            continue;
+        }
+
+        let mut buffer = Vec::new();
+        entry.read_to_end(&mut buffer).map_err(|err| err.to_string())?;
+        let text = String::from_utf8_lossy(&buffer).trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        files.push(ArchivedLogFile { path, text });
+    }
+
+    Ok(files)
+}
+
+fn choose_better_log(direct: Option<String>, archive: Option<String>) -> Option<String> {
+    match (direct, archive) {
+        (Some(direct), Some(archive)) => {
+            if archive.trim().len() > direct.trim().len() {
+                Some(archive)
+            } else {
+                Some(direct)
+            }
+        }
+        (Some(direct), None) => Some(direct),
+        (None, Some(archive)) => Some(archive),
+        (None, None) => None,
+    }
+}
+
+fn match_archived_logs_to_jobs(jobs: &[Job], files: &[ArchivedLogFile]) -> HashMap<i64, String> {
+    let mut matched = HashMap::new();
+    let mut used_indices = HashSet::new();
+
+    if jobs.len() == 1 && !files.is_empty() {
+        matched.insert(jobs[0].id, format_archived_files(files.iter()));
+        return matched;
+    }
+
+    for job in jobs {
+        let normalized_name = normalize_log_key(&job.name);
+        let mut chunks = Vec::new();
+
+        for (index, file) in files.iter().enumerate() {
+            if used_indices.contains(&index) {
+                continue;
+            }
+
+            let normalized_path = normalize_log_key(&file.path);
+            let file_name = file
+                .path
+                .rsplit('/')
+                .next()
+                .map(normalize_log_key)
+                .unwrap_or_default();
+            let stem = file_name
+                .strip_suffix("txt")
+                .or_else(|| file_name.strip_suffix("log"))
+                .map(|value| value.trim_end_matches('.').to_string())
+                .unwrap_or(file_name.clone());
+
+            let is_match = normalized_path.contains(&normalized_name)
+                || file_name.contains(&normalized_name)
+                || stem.contains(&normalized_name);
+
+            if is_match {
+                used_indices.insert(index);
+                chunks.push(format!("### {}\n{}\n", file.path, file.text));
+            }
+        }
+
+        if !chunks.is_empty() {
+            matched.insert(job.id, chunks.join("\n"));
+        }
+    }
+
+    if matched.is_empty() && !files.is_empty() {
+        if let Some(active_job) = jobs
+            .iter()
+            .find(|job| job.status != "completed" || job.conclusion.is_none())
+            .or_else(|| jobs.first())
+        {
+            matched.insert(active_job.id, format_archived_files(files.iter()));
+        }
+    }
+
+    matched
+}
+
+fn format_archived_files<'a>(files: impl Iterator<Item = &'a ArchivedLogFile>) -> String {
+    files
+        .map(|file| format!("### {}\n{}\n", file.path, file.text))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_log_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|char| if char.is_ascii_alphanumeric() { char.to_ascii_lowercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn flatten_logs(jobs: &[Job], job_logs: &[(i64, String)]) -> String {
     let mut output = String::new();
 
@@ -605,6 +703,11 @@ pub fn flatten_logs(jobs: &[Job], job_logs: &[(i64, String)]) -> String {
         if let Some((_, logs)) = job_logs.iter().find(|(job_id, _)| *job_id == job.id) {
             output.push_str(logs);
         } else {
+            if job.status != "completed" {
+                output.push_str("GitHub 尚未提供可下载实时日志，当前先展示步骤状态。应用会继续轮询。\n");
+            } else {
+                output.push_str("GitHub 未返回该 Job 的可下载日志，当前先展示步骤状态。\n");
+            }
             for Step { name, status, conclusion, .. } in &job.steps {
                 output.push_str(&format!(
                     "- step={} status={:?} conclusion={:?}\n",

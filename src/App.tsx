@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/tauri'
 import './App.css'
 import { inferDefaultValue, normalizeText, type FormValue } from './lib/workflow-utils'
 
-type ThemeMode = 'system' | 'light' | 'dark'
+type ThemeMode = 'light' | 'dark'
 
 interface AccountSummary {
   id: string
@@ -115,21 +115,11 @@ interface Artifact {
   expires_at: string | null
 }
 
-interface JobSummary {
-  id: number
-  name: string
-  conclusion: string | null
-  summary: string
-  text: string | null
-  details_url: string | null
-}
-
 interface RunBundle {
   run: Run
   jobs: Job[]
   artifacts: Artifact[]
   log_text: string
-  job_summaries: JobSummary[]
   audit_entries: AuditEntry[]
 }
 
@@ -162,6 +152,12 @@ const statusTone: Record<string, string> = {
 
 async function safeInvoke<T>(command: string, args?: InvokeArgs): Promise<T> {
   return invoke<T>(command, args)
+}
+
+const plainTextInputProps = {
+  autoCapitalize: 'none' as const,
+  autoCorrect: 'off' as const,
+  spellCheck: false,
 }
 
 function toLocalTime(value: string | null | undefined) {
@@ -210,7 +206,7 @@ function ellipsize(value: string | null | undefined, max = 88) {
 }
 
 function App() {
-  const [themeMode, setThemeMode] = useState<ThemeMode>('system')
+  const [themeMode, setThemeMode] = useState<ThemeMode>('dark')
   const [bootstrapped, setBootstrapped] = useState(false)
   const [accounts, setAccounts] = useState<AccountSummary[]>([])
   const [repositories, setRepositories] = useState<Repository[]>([])
@@ -223,6 +219,7 @@ function App() {
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<number | null>(null)
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null)
   const [repoQuery, setRepoQuery] = useState('')
+  const [showAllRepos, setShowAllRepos] = useState(true)
   const [selectedRef, setSelectedRef] = useState('')
   const [formValues, setFormValues] = useState<Record<string, FormValue>>({})
   const [showAddAccount, setShowAddAccount] = useState(false)
@@ -235,7 +232,7 @@ function App() {
 
   useEffect(() => {
     const storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY) as ThemeMode | null
-    if (storedTheme) {
+    if (storedTheme === 'light' || storedTheme === 'dark') {
       setThemeMode(storedTheme)
     }
   }, [])
@@ -273,11 +270,14 @@ function App() {
     void bootstrap()
   }, [])
 
-  async function loadRepositories(accountId: string) {
+  async function loadRepositories(accountId: string, allAccessible = showAllRepos) {
     setLoadingLabel('拉取仓库列表')
     setError('')
     try {
-      const nextRepositories = await safeInvoke<Repository[]>('fetch_repositories', { accountId })
+      const nextRepositories = await safeInvoke<Repository[]>('fetch_repositories', {
+        accountId,
+        allAccessible,
+      })
       setRepositories(nextRepositories)
       const nextRepo =
         nextRepositories.find((repo) => repo.full_name === selectedRepoFullName)?.full_name ??
@@ -299,8 +299,8 @@ function App() {
       setBranches([])
       return
     }
-    void loadRepositories(selectedAccountId)
-  }, [selectedAccountId])
+    void loadRepositories(selectedAccountId, showAllRepos)
+  }, [selectedAccountId, showAllRepos])
 
   async function loadRepoData(accountId: string, repoFullName: string, reference?: string) {
     setLoadingLabel('同步 workflow')
@@ -336,9 +336,11 @@ function App() {
     }
   }
 
-  async function loadRuns(accountId: string, repoFullName: string) {
-    setLoadingLabel('同步运行记录')
-    setError('')
+  async function loadRuns(accountId: string, repoFullName: string, silent = false) {
+    if (!silent) {
+      setLoadingLabel('同步运行记录')
+      setError('')
+    }
     try {
       const nextRuns = await safeInvoke<Run[]>('fetch_runs', {
         accountId,
@@ -346,13 +348,44 @@ function App() {
         limit: 40,
       })
       setRuns(nextRuns)
-      setSelectedRunId(nextRuns[0]?.id ?? null)
+      setSelectedRunId((current) =>
+        nextRuns.some((run) => run.id === current) ? current : (nextRuns[0]?.id ?? null),
+      )
     } catch (err) {
-      setError(String(err))
+      if (!silent) {
+        setError(String(err))
+      }
       setRuns([])
       setSelectedRunId(null)
     } finally {
-      setLoadingLabel('')
+      if (!silent) {
+        setLoadingLabel('')
+      }
+    }
+  }
+
+  async function fetchRunBundle(accountId: string, repoFullName: string, runId: number, silent = false) {
+    if (!silent) {
+      setLoadingLabel('拉取运行详情')
+    }
+    try {
+      const bundle = await safeInvoke<RunBundle>('get_run_bundle', {
+        accountId,
+        repoFullName,
+        runId,
+      })
+      setRunBundle(bundle)
+      return bundle
+    } catch (err) {
+      if (!silent) {
+        setError(String(err))
+      }
+      setRunBundle(null)
+      return null
+    } finally {
+      if (!silent) {
+        setLoadingLabel('')
+      }
     }
   }
 
@@ -388,26 +421,10 @@ function App() {
     }
 
     let cancelled = false
-    setLoadingLabel('拉取运行详情')
-    void safeInvoke<RunBundle>('get_run_bundle', {
-      accountId: selectedAccountId,
-      repoFullName: selectedRepoFullName,
-      runId: selectedRunId,
-    })
+    void fetchRunBundle(selectedAccountId, selectedRepoFullName, selectedRunId)
       .then((bundle) => {
         if (!cancelled) {
           setRunBundle(bundle)
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setError(String(err))
-          setRunBundle(null)
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setLoadingLabel('')
         }
       })
 
@@ -415,6 +432,22 @@ function App() {
       cancelled = true
     }
   }, [selectedAccountId, selectedRepoFullName, selectedRunId])
+
+  useEffect(() => {
+    if (!selectedAccountId || !selectedRepoFullName || !selectedRunId || !runBundle) {
+      return
+    }
+    if (runBundle.run.status === 'completed') {
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      void loadRuns(selectedAccountId, selectedRepoFullName, true)
+      void fetchRunBundle(selectedAccountId, selectedRepoFullName, selectedRunId, true)
+    }, 4000)
+
+    return () => window.clearInterval(timer)
+  }, [selectedAccountId, selectedRepoFullName, selectedRunId, runBundle?.run.status])
 
   const selectedRepository =
     repositories.find((repo) => repo.full_name === selectedRepoFullName) ?? null
@@ -626,13 +659,13 @@ function App() {
           <section className="panel account-panel">
             <div className="theme-strip">
               <div className="theme-toggle" role="tablist" aria-label="Theme mode">
-                {(['system', 'light', 'dark'] as ThemeMode[]).map((mode) => (
+                {(['light', 'dark'] as ThemeMode[]).map((mode) => (
                   <button
                     key={mode}
                     className={themeMode === mode ? 'active' : ''}
                     onClick={() => setThemeMode(mode)}
                   >
-                    {mode === 'system' ? '跟随系统' : mode === 'light' ? '浅色' : '深色'}
+                    {mode === 'light' ? '浅色' : '深色'}
                   </button>
                 ))}
               </div>
@@ -640,8 +673,18 @@ function App() {
 
             <div className="section-title">
               <span>账户</span>
-              <button className="ghost-button" onClick={() => setShowAddAccount((value) => !value)}>
+              <button className="ghost-button add-account-button" onClick={() => setShowAddAccount((value) => !value)}>
                 {showAddAccount ? '收起' : '添加账户'}
+              </button>
+            </div>
+
+            <div className="rail-filters">
+              <button
+                className={`filter-chip repo-scope-chip ${showAllRepos ? 'active' : ''}`}
+                onClick={() => setShowAllRepos((value) => !value)}
+                type="button"
+              >
+                all repo
               </button>
             </div>
 
@@ -649,11 +692,12 @@ function App() {
               <div className="account-form">
                 <label className="field">
                   <span>账户名称</span>
-                  <input value={accountName} onChange={(event) => setAccountName(event.target.value)} />
+                  <input {...plainTextInputProps} value={accountName} onChange={(event) => setAccountName(event.target.value)} />
                 </label>
                 <label className="field">
                   <span>GitHub PAT</span>
                   <input
+                    {...plainTextInputProps}
                     type="password"
                     value={accountToken}
                     onChange={(event) => setAccountToken(event.target.value)}
@@ -689,6 +733,7 @@ function App() {
             <label className="search-field">
               <span>仓库搜索</span>
               <input
+                {...plainTextInputProps}
                 placeholder="仅按仓库名搜索"
                 value={repoQuery}
                 onChange={(event) => setRepoQuery(event.target.value)}
@@ -711,7 +756,9 @@ function App() {
 
         </aside>
 
-        <section className="panel workflow-panel">
+        <section className="content-stack">
+          <div className="top-panels">
+            <section className="panel workflow-panel">
             <div className="section-title">
               <span>Workflow Dispatch</span>
             </div>
@@ -762,7 +809,7 @@ function App() {
                               ))}
                             </select>
                           ) : (
-                            <input value={selectedRef} onChange={(event) => setSelectedRef(event.target.value)} />
+                            <input {...plainTextInputProps} value={selectedRef} onChange={(event) => setSelectedRef(event.target.value)} />
                           )}
                         </label>
 
@@ -806,6 +853,7 @@ function App() {
                               </select>
                             ) : (
                               <input
+                                {...plainTextInputProps}
                                 type={input.type === 'number' ? 'number' : 'text'}
                                 value={String(formValues[input.name] ?? '')}
                                 onChange={(event) =>
@@ -878,6 +926,7 @@ function App() {
               )) : <div className="empty-state">没有符合筛选条件的运行记录。</div>}
             </div>
           </section>
+          </div>
 
           <section className="panel detail-panel">
             <div className="section-title">
@@ -907,35 +956,6 @@ function App() {
                   <span className={`status-badge ${statusTone[runBundle.run.status] ?? 'neutral'}`}>
                     {runBundle.run.status}
                   </span>
-                </div>
-
-                <div className="detail-block">
-                  <h4>GitHub Action Summary</h4>
-                  <div className="summary-list scroll-panel">
-                    {runBundle.job_summaries.length > 0 ? runBundle.job_summaries.map((summary) => (
-                      <article className="summary-card" key={summary.id}>
-                        <div className="summary-card-head">
-                          <strong className="truncate-1" title={summary.name}>{summary.name}</strong>
-                          {summary.conclusion ? (
-                            <span className={`status-badge ${statusTone[summary.conclusion] ?? 'neutral'}`}>
-                              {summary.conclusion}
-                            </span>
-                          ) : null}
-                        </div>
-                        {summary.summary ? <pre>{summary.summary}</pre> : null}
-                        {summary.text ? <pre>{summary.text}</pre> : null}
-                      </article>
-                    )) : (
-                      <div className="empty-state">当前运行没有返回 GitHub Action Summary。</div>
-                    )}
-                  </div>
-                  <div className="inline-actions">
-                    <button className="ghost-button" onClick={() => void handleExport('markdown')}>导出 Markdown</button>
-                    <button className="ghost-button" onClick={() => void handleExport('json')}>导出 JSON</button>
-                    <a className="ghost-link" href={runBundle.run.html_url} target="_blank" rel="noreferrer">
-                      GitHub 页面
-                    </a>
-                  </div>
                 </div>
 
                 <div className="detail-block">
@@ -1000,11 +1020,20 @@ function App() {
                   </div>
                 </div>
 
+                <div className="inline-actions detail-links">
+                  <button className="ghost-button" onClick={() => void handleExport('markdown')}>导出 Markdown</button>
+                  <button className="ghost-button" onClick={() => void handleExport('json')}>导出 JSON</button>
+                  <a className="ghost-link" href={runBundle.run.html_url} target="_blank" rel="noreferrer">
+                    GitHub 页面
+                  </a>
+                </div>
+
               </>
             ) : (
               <div className="empty-state">选择一条运行记录后显示详情。</div>
             )}
           </section>
+        </section>
       </main>
 
       {toast ? (

@@ -123,16 +123,6 @@ pub struct Artifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobSummary {
-    pub id: i64,
-    pub name: String,
-    pub conclusion: Option<String>,
-    pub summary: String,
-    pub text: Option<String>,
-    pub details_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub id: String,
     pub action: String,
@@ -149,7 +139,6 @@ pub struct RunBundle {
     pub jobs: Vec<Job>,
     pub artifacts: Vec<Artifact>,
     pub log_text: String,
-    pub job_summaries: Vec<JobSummary>,
     pub audit_entries: Vec<AuditEntry>,
 }
 

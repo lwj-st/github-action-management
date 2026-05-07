@@ -49,18 +49,7 @@ async fn build_run_bundle(
     let run = client.get_run(owner, repo, run_id).await?;
     let jobs = client.get_jobs(owner, repo, run_id).await?;
     let artifacts = client.get_artifacts(owner, repo, run_id).await?;
-    let job_names = jobs.iter().map(|job| job.name.clone()).collect::<Vec<_>>();
-    let job_summaries = client
-        .get_job_summaries(owner, repo, run.id, &run.head_sha, &job_names, run.check_suite_id)
-        .await
-        .unwrap_or_default();
-
-    let mut collected_logs = Vec::new();
-    for job in &jobs {
-        if let Ok(logs) = client.get_job_logs(owner, repo, job.id).await {
-            collected_logs.push((job.id, logs));
-        }
-    }
+    let collected_logs = client.collect_logs_for_run(owner, repo, &run, &jobs).await;
 
     let log_text = flatten_logs(&jobs, &collected_logs);
 
@@ -69,7 +58,6 @@ async fn build_run_bundle(
         jobs,
         artifacts,
         log_text,
-        job_summaries,
         audit_entries,
     })
 }
@@ -184,13 +172,14 @@ fn set_selected_repository(
 async fn fetch_repositories(
     context: tauri::State<'_, AppContext>,
     account_id: String,
+    all_accessible: Option<bool>,
 ) -> Result<Vec<Repository>, String> {
     let token = {
         let state = context.state.lock().map_err(|err| err.to_string())?;
         account_token(&state.stored, &account_id)?
     };
     let client = GitHubClient::new(&token)?;
-    let repositories = client.get_repositories().await?;
+    let repositories = client.get_repositories(all_accessible.unwrap_or(true)).await?;
 
     {
         let mut state = context.state.lock().map_err(|err| err.to_string())?;
@@ -523,23 +512,7 @@ async fn export_run_report(
                 "- Conclusion: `{}`\n\n",
                 bundle.run.conclusion.clone().unwrap_or_else(|| "n/a".to_string())
             ));
-            markdown.push_str("## GitHub Action Summary\n");
-            if bundle.job_summaries.is_empty() {
-                markdown.push_str("- No job summaries were returned by GitHub.\n");
-            } else {
-                for summary in &bundle.job_summaries {
-                    markdown.push_str(&format!("### {}\n\n", summary.name));
-                    if !summary.summary.is_empty() {
-                        markdown.push_str(&summary.summary);
-                        markdown.push_str("\n\n");
-                    }
-                    if let Some(text) = &summary.text {
-                        markdown.push_str(text);
-                        markdown.push_str("\n\n");
-                    }
-                }
-            }
-            markdown.push_str("\n## Jobs\n");
+            markdown.push_str("## Jobs\n");
             for job in &bundle.jobs {
                 markdown.push_str(&format!(
                     "- `{}` status=`{}` conclusion=`{}`\n",
