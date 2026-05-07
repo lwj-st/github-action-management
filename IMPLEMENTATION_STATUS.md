@@ -77,7 +77,7 @@
 ## ⏳ 规划功能 (V1.2)
 
 ### 1. 安全增强
-- [ ] 本地密钥环集成（Keychain/Credential Manager）
+- [x] 本地账户凭据存储（按当前产品决策改为 SQLite 文件，不再依赖 Keychain / Credential Manager）
 - [ ] Token 过期提醒
 - [ ] 一键轮换
 - [ ] 操作审计日志

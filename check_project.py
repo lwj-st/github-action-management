@@ -3,11 +3,12 @@
 GitHub Action Management - 项目完整性检查脚本
 """
 
-import subprocess
 import os
+import subprocess
+from pathlib import Path
 
 # 项目路径
-project_path = "/opt/data/workspace/github-action-management"
+project_path = Path(__file__).resolve().parent
 
 print("=" * 70)
 print("🔍 GitHub Action Management - 项目完整性检查")
@@ -18,10 +19,8 @@ files_to_check = {
     "前端源码": [
         "src/App.tsx",
         "src/main.tsx",
-        "src/types.ts",
-        "src/components/Sidebar.tsx",
-        "src/components/WorkflowPanel.tsx",
-        "src/components/RunsPanel.tsx",
+        "src/App.css",
+        "src/index.css",
     ],
     "后端源码": [
         "src-tauri/src/main.rs",
@@ -30,7 +29,7 @@ files_to_check = {
     ],
     "配置文件": [
         "package.json",
-        "Cargo.toml",
+        "src-tauri/Cargo.toml",
         "vite.config.ts",
         "tsconfig.json",
         "tauri.conf.json",
@@ -55,9 +54,9 @@ for category, files in files_to_check.items():
     print(f"\n📁 {category}:")
     print("-" * 70)
     for f in files:
-        path = os.path.join(project_path, f)
-        if os.path.exists(path):
-            size = os.path.getsize(path)
+        path = project_path / f
+        if path.exists():
+            size = path.stat().st_size
             print(f"   ✅ {f:40s} ({size:6,} bytes)")
         else:
             print(f"   ❌ {f:40s} 未找到")
@@ -73,7 +72,7 @@ print("=" * 70)
 # 统计文件
 print("\n📊 项目统计:")
 result = subprocess.run(
-    ["find", project_path, "-type", "f",
+    ["find", str(project_path), "-type", "f",
      "-not", "-path", "*/node_modules/*",
      "-not", "-path", "*/target/*"],
     capture_output=True, text=True

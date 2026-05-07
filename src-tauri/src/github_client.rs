@@ -1,326 +1,338 @@
-use crate::models::*;
-use reqwest::Client;
-use serde_json::json;
-use std::sync::Arc;
+use crate::models::{Artifact, Branch, Job, JobSummary, Repository, Run, Step, Workflow, WorkflowInput};
+use base64::Engine;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+use serde_yaml::{Mapping, Value as YamlValue};
+use tokio::time::{sleep, Duration};
 
-/// GitHub API 客户端
+const API_BASE: &str = "https://api.github.com";
+
+#[derive(Debug, Deserialize)]
+struct WorkflowListResponse {
+    workflows: Vec<Workflow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunListResponse {
+    workflow_runs: Vec<Run>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobsResponse {
+    jobs: Vec<Job>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactListResponse {
+    artifacts: Vec<Artifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchListItem {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRunsResponse {
+    check_runs: Vec<CheckRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRun {
+    id: i64,
+    name: String,
+    conclusion: Option<String>,
+    details_url: Option<String>,
+    output: CheckRunOutput,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CheckRunOutput {
+    summary: Option<String>,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContentResponse {
+    content: String,
+    encoding: String,
+}
+
 pub struct GitHubClient {
-    client: Client,
-    token: String,
+    client: reqwest::Client,
 }
 
 impl GitHubClient {
-    pub fn new(token: String) -> Self {
-        Self {
-            client: Client::new(),
-            token,
-        }
+    pub fn new(token: &str) -> Result<Self, String> {
+        let client = reqwest::Client::builder()
+            .default_headers(Self::headers(token)?)
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .map_err(|err| err.to_string())?;
+
+        Ok(Self { client })
     }
 
-    /// 获取 HTTP 请求头
-    fn headers(&self) -> reqwest::header::HeaderMap {
-        let mut headers = reqwest::header::HeaderMap::new();
+    fn headers(token: &str) -> Result<HeaderMap, String> {
+        let mut headers = HeaderMap::new();
         headers.insert(
-            "Authorization",
-            format!("Bearer {}", self.token)
-                .parse()
-                .unwrap(),
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(|err| err.to_string())?,
         );
         headers.insert(
-            "Accept",
-            "application/vnd.github.v3+json".parse().unwrap(),
+            ACCEPT,
+            HeaderValue::from_static("application/vnd.github+json"),
         );
         headers.insert(
             "X-GitHub-Api-Version",
-            "2022-11-28".parse().unwrap(),
+            HeaderValue::from_static("2022-11-28"),
         );
-        headers
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static("github-action-management-desktop"),
+        );
+        Ok(headers)
     }
 
-    /// 获取用户信息
-    pub async fn get_user(&self) -> Result<serde_json::Value, String> {
-        let response = self
-            .client
-            .get("https://api.github.com/user")
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("Failed to get user: {}", e))?;
-
-        if response.status().is_success() {
-            Ok(response.json().await.unwrap_or_default())
-        } else {
-            Err(format!("GitHub API error: {}", response.status()))
+    async fn send_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T, String> {
+        let response = request.send().await.map_err(|err| err.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("GitHub API error {status}: {body}"));
         }
+        response.json::<T>().await.map_err(|err| err.to_string())
     }
 
-    /// 获取用户有权限的仓库列表
+    async fn send_unit(&self, request: reqwest::RequestBuilder) -> Result<(), String> {
+        let response = request.send().await.map_err(|err| err.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("GitHub API error {status}: {body}"));
+        }
+        Ok(())
+    }
+
+    pub async fn validate_token(&self) -> Result<(), String> {
+        self.send_unit(self.client.get(format!("{API_BASE}/user"))).await
+    }
+
     pub async fn get_repositories(&self) -> Result<Vec<Repository>, String> {
-        let mut repos = Vec::new();
         let mut page = 1;
-        let per_page = 100;
+        let mut repositories = Vec::new();
 
         loop {
-            let url = format!(
-                "https://api.github.com/user/repos?per_page={}&page={}&type=all&sort=updated",
-                per_page, page
-            );
+            let page_result: Vec<Repository> = self
+                .send_json(
+                    self.client.get(format!(
+                        "{API_BASE}/user/repos?per_page=100&page={page}&sort=updated&type=all"
+                    )),
+                )
+                .await?;
 
-            let response = self
-                .client
-                .get(&url)
-                .headers(self.headers())
-                .send()
-                .await
-                .map_err(|e| format!("Failed to fetch repos: {}", e))?;
-
-            if !response.status().is_success() {
-                return Err(format!("GitHub API error: {}", response.status()));
-            }
-
-            let repo_list: Vec<Repository> = response.json().await.unwrap_or_default();
-
-            if repo_list.is_empty() {
+            if page_result.is_empty() {
                 break;
             }
 
-            repos.extend(repo_list);
+            repositories.extend(page_result.iter().cloned());
+
+            if page_result.len() < 100 {
+                break;
+            }
             page += 1;
+        }
 
-            // 如果获取的数量小于 per_page，说明已经是最后一页
-            if repo_list.len() < per_page {
+        Ok(repositories)
+    }
+
+    pub async fn get_branches(&self, owner: &str, repo: &str) -> Result<Vec<Branch>, String> {
+        let mut page = 1;
+        let mut branches = Vec::new();
+
+        loop {
+            let page_result: Vec<BranchListItem> = self
+                .send_json(
+                    self.client
+                        .get(format!("{API_BASE}/repos/{owner}/{repo}/branches?per_page=100&page={page}")),
+                )
+                .await?;
+            let page_len = page_result.len();
+
+            if page_result.is_empty() {
                 break;
             }
-        }
 
-        Ok(repos)
-    }
-
-    /// 获取指定仓库的 Workflows 列表
-    pub async fn get_workflows(
-        &self,
-        owner: &str,
-        repo: &str,
-    ) -> Result<Vec<Workflow>, String> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/actions/workflows",
-            owner, repo
-        );
-
-        let response = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("Failed to get workflows: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("GitHub API error: {}", response.status()));
-        }
-
-        let data: serde_json::Value = response.json().await.unwrap_or_default();
-        let workflows: Vec<Workflow> = data
-            .get("workflows")
-            .and_then(|w| w.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|w| {
-                serde_json::from_value(w).ok()
-            })
-            .collect();
-
-        Ok(workflows)
-    }
-
-    /// 获取 Workflow 的 YAML 文件内容
-    pub async fn get_workflow_yaml(
-        &self,
-        owner: &str,
-        repo: &str,
-        workflow_id: i64,
-    ) -> Result<String, String> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/actions/workflows/{}.yml",
-            owner, repo, workflow_id
-        );
-
-        let response = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("Failed to get workflow YAML: {}", e))?;
-
-        if !response.status().is_success() {
-            // 尝试 .yaml 后缀
-            let url_yaml = format!(
-                "https://api.github.com/repos/{}/{}/actions/workflows/{}.yaml",
-                owner, repo, workflow_id
+            branches.extend(
+                page_result
+                    .into_iter()
+                    .map(|branch| Branch { name: branch.name }),
             );
-            let response_yaml = self
-                .client
-                .get(&url_yaml)
-                .headers(self.headers())
-                .send()
-                .await
-                .map_err(|e| format!("Failed to get workflow YAML: {}", e))?;
 
-            if !response_yaml.status().is_success() {
-                return Err(format!("Failed to get workflow YAML: {}", response.status()));
+            if page_len < 100 {
+                break;
             }
-
-            Ok(response_yaml.text().await.unwrap_or_default())
-        } else {
-            Ok(response.text().await.unwrap_or_default())
+            page += 1;
         }
+
+        Ok(branches)
     }
 
-    /// 解析 Workflow 的输入参数
+    pub async fn get_workflows(&self, owner: &str, repo: &str) -> Result<Vec<Workflow>, String> {
+        let response: WorkflowListResponse = self
+            .send_json(self.client.get(format!(
+                "{API_BASE}/repos/{owner}/{repo}/actions/workflows"
+            )))
+            .await?;
+        Ok(response.workflows)
+    }
+
+    pub async fn get_workflow_inputs(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<Vec<WorkflowInput>, String> {
+        let encoded_path = path
+            .split('/')
+            .map(urlencoding::encode)
+            .collect::<Vec<_>>()
+            .join("/");
+        let content: ContentResponse = self
+            .send_json(self.client.get(format!(
+                "{API_BASE}/repos/{owner}/{repo}/contents/{encoded_path}?ref={reference}"
+            )))
+            .await?;
+
+        let yaml_content = if content.encoding == "base64" {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(content.content.replace('\n', ""))
+                .map_err(|err| err.to_string())?;
+            String::from_utf8(decoded).map_err(|err| err.to_string())?
+        } else {
+            content.content
+        };
+
+        Self::parse_workflow_inputs(&yaml_content)
+    }
+
     pub fn parse_workflow_inputs(yaml_content: &str) -> Result<Vec<WorkflowInput>, String> {
+        let root: YamlValue = serde_yaml::from_str(yaml_content).map_err(|err| err.to_string())?;
+        let root_mapping = root
+            .as_mapping()
+            .ok_or("Workflow YAML root is not a mapping")?;
+
+        let on_node = mapping_get(root_mapping, "on").or_else(|| mapping_get(root_mapping, "\"on\""));
+        let Some(on_node) = on_node else {
+            return Ok(Vec::new());
+        };
+
+        let dispatch_node = match on_node {
+            YamlValue::Mapping(mapping) => mapping_get(mapping, "workflow_dispatch"),
+            _ => None,
+        };
+        let Some(dispatch_node) = dispatch_node else {
+            return Ok(Vec::new());
+        };
+
+        let dispatch_mapping = dispatch_node
+            .as_mapping()
+            .ok_or("workflow_dispatch must be a mapping")?;
+        let inputs_node = mapping_get(dispatch_mapping, "inputs");
+        let Some(inputs_node) = inputs_node else {
+            return Ok(Vec::new());
+        };
+
+        let inputs_mapping = inputs_node
+            .as_mapping()
+            .ok_or("workflow_dispatch.inputs must be a mapping")?;
+
         let mut inputs = Vec::new();
+        for (name_node, config_node) in inputs_mapping {
+            let Some(name) = name_node.as_str() else {
+                continue;
+            };
+            let Some(config) = config_node.as_mapping() else {
+                continue;
+            };
 
-        // 简单解析 YAML 中的 workflow_dispatch 部分
-        // 注意：完整解析需要使用 YAML 解析库
-        if !yaml_content.contains("workflow_dispatch") {
-            return Ok(inputs);
-        }
+            let label = name.replace('_', " ");
+            let description = mapping_get(config, "description")
+                .and_then(YamlValue::as_str)
+                .map(str::to_string);
+            let required = mapping_get(config, "required")
+                .and_then(YamlValue::as_bool)
+                .unwrap_or(false);
+            let input_type = mapping_get(config, "type")
+                .and_then(YamlValue::as_str)
+                .unwrap_or("string")
+                .to_string();
+            let options = mapping_get(config, "options")
+                .and_then(YamlValue::as_sequence)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let default_value = mapping_get(config, "default").map(yaml_scalar_to_string);
 
-        // 查找 workflow_dispatch 块
-        if let Some(start) = yaml_content.find("workflow_dispatch") {
-            if let Some(inputs_start) = yaml_content[start..].find("inputs:") {
-                let inputs_block_start = start + inputs_start + 7;
-                let remaining = &yaml_content[inputs_block_start..];
-
-                // 解析 inputs 下的每个参数
-                let lines: Vec<&str> = remaining.lines().skip(1).collect();
-                let mut current_input: Option<WorkflowInput> = None;
-
-                for line in lines {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() || trimmed.starts_with("#") {
-                        continue;
-                    }
-
-                    // 检测新的 input（以空格开头 + 冒号）
-                    if trimmed.starts_with("- ") || trimmed.contains(":") && !trimmed.starts_with("  ") {
-                        // 保存前一个 input
-                        if let Some(input) = current_input.take() {
-                            inputs.push(input);
-                        }
-
-                        // 解析新 input 的名称
-                        if let Some(name_part) = trimmed.strip_prefix("- ") {
-                            if let Some(name) = name_part.split(':').next() {
-                                current_input = Some(WorkflowInput {
-                                    name: name.trim().to_string(),
-                                    description: None,
-                                    required: false,
-                                    type_val: "string".to_string(),
-                                    options: None,
-                                    default: None,
-                                });
-                            }
-                        }
-                    } else if let Some(ref mut input) = current_input {
-                        // 解析当前 input 的属性
-                        if trimmed.starts_with("description:") {
-                            input.description = Some(
-                                trimmed
-                                    .split_once(":")
-                                    .map(|(_, v)| v.trim().trim_matches('"').trim_matches('\'').to_string())
-                                    .unwrap_or_default(),
-                            );
-                        } else if trimmed.starts_with("required:") {
-                            input.required = trimmed
-                                .split_once(":")
-                                .map(|(_, v)| v.trim().to_lowercase() == "true")
-                                .unwrap_or(false);
-                        } else if trimmed.starts_with("type:") {
-                            input.type_val = trimmed
-                                .split_once(":")
-                                .map(|(_, v)| v.trim().to_string())
-                                .unwrap_or("string".to_string());
-                        } else if trimmed.starts_with("default:") {
-                            input.default = Some(
-                                trimmed
-                                    .split_once(":")
-                                    .map(|(_, v)| v.trim().trim_matches('"').trim_matches('\'').to_string())
-                                    .unwrap_or_default(),
-                            );
-                        } else if trimmed.starts_with("options:") {
-                            // 解析选项列表
-                            let mut options = Vec::new();
-                            for opt_line in lines.iter().skip_while(|l| !l.starts_with("options:")) {
-                                if opt_line.trim().starts_with("- ") {
-                                    let opt = opt_line.trim()[2..]
-                                        .trim_matches('"')
-                                        .trim_matches('\'')
-                                        .to_string();
-                                    options.push(opt);
-                                } else if !opt_line.trim().is_empty() && !opt_line.trim().starts_with("-") {
-                                    break;
-                                }
-                            }
-                            input.options = if options.is_empty() { None } else { Some(options) };
-                            break;
-                        }
-                    }
-                }
-
-                // 保存最后一个 input
-                if let Some(input) = current_input {
-                    inputs.push(input);
-                }
-            }
+            inputs.push(WorkflowInput {
+                name: name.to_string(),
+                label,
+                description,
+                required,
+                input_type,
+                options,
+                default_value,
+            });
         }
 
         Ok(inputs)
     }
 
-    /// 触发 Workflow
     pub async fn trigger_workflow(
         &self,
         owner: &str,
         repo: &str,
         workflow_id: i64,
-        ref_branch: &str,
-        inputs: Option<&serde_json::Value>,
-    ) -> Result<Run, String> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/actions/workflows/{}/dispatches",
-            owner, repo, workflow_id
-        );
-
-        let mut payload = json!({
-            "ref": ref_branch
-        });
-
-        if let Some(inputs_val) = inputs {
-            payload["inputs"] = inputs_val.clone();
+        reference: &str,
+        inputs: Option<Value>,
+    ) -> Result<Option<Run>, String> {
+        let mut payload = Map::new();
+        payload.insert("ref".to_string(), Value::String(reference.to_string()));
+        if let Some(Value::Object(object)) = inputs {
+            payload.insert("inputs".to_string(), Value::Object(object));
         }
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(self.headers())
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to trigger workflow: {}", e))?;
+        self.send_unit(
+            self.client
+                .post(format!(
+                    "{API_BASE}/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches"
+                ))
+                .json(&Value::Object(payload)),
+        )
+        .await?;
 
-        if !response.status().is_success() {
-            return Err(format!("Failed to trigger workflow: {}", response.status()));
+        for _ in 0..5 {
+            sleep(Duration::from_millis(1200)).await;
+            let runs = self
+                .get_runs(owner, repo, Some(workflow_id), Some(reference), None, 10)
+                .await?;
+            if let Some(run) = runs.into_iter().next() {
+                return Ok(Some(run));
+            }
         }
 
-        let run: Run = response.json().await.map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        Ok(run)
+        Ok(None)
     }
 
-    /// 获取 Workflow 运行列表
     pub async fn get_runs(
         &self,
         owner: &str,
@@ -328,219 +340,340 @@ impl GitHubClient {
         workflow_id: Option<i64>,
         branch: Option<&str>,
         status: Option<&str>,
-        limit: i32,
+        per_page: i32,
     ) -> Result<Vec<Run>, String> {
-        let mut url = format!(
-            "https://api.github.com/repos/{}/{}/actions/runs?per_page={}",
-            owner, repo, limit
-        );
-
-        if let Some(wid) = workflow_id {
-            url = format!("{}&workflow_id={}", url, wid);
+        let mut url = if let Some(workflow_id) = workflow_id {
+            format!(
+                "{API_BASE}/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs?per_page={per_page}"
+            )
+        } else {
+            format!("{API_BASE}/repos/{owner}/{repo}/actions/runs?per_page={per_page}")
+        };
+        if let Some(branch) = branch {
+            url.push_str(&format!("&branch={branch}"));
         }
-        if let Some(br) = branch {
-            url = format!("{}&branch={}", url, br);
-        }
-        if let Some(st) = status {
-            url = format!("{}&status={}", url, st);
-        }
-
-        let response = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("Failed to get runs: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("GitHub API error: {}", response.status()));
+        if let Some(status) = status {
+            url.push_str(&format!("&status={status}"));
         }
 
-        let data: serde_json::Value = response.json().await.unwrap_or_default();
-        let runs: Vec<Run> = data
-            .get("workflow_runs")
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|r| serde_json::from_value(r).ok())
-            .collect();
-
-        Ok(runs)
+        let response: WorkflowRunListResponse = self.send_json(self.client.get(url)).await?;
+        Ok(response.workflow_runs)
     }
 
-    /// 获取单个运行详情
     pub async fn get_run(&self, owner: &str, repo: &str, run_id: i64) -> Result<Run, String> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/actions/runs/{}",
-            owner, repo, run_id
-        );
-
-        let response = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("Failed to get run: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("GitHub API error: {}", response.status()));
-        }
-
-        let run: Run = response.json().await.map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        Ok(run)
+        self.send_json(
+            self.client
+                .get(format!("{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}")),
+        )
+        .await
     }
 
-    /// 取消运行
-    pub async fn cancel_run(&self, owner: &str, repo: &str, run_id: i64) -> Result<(), String> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/actions/runs/{}",
-            owner, repo, run_id
-        );
-
-        let response = self
-            .client
-            .post(format!("{}/cancel", url))
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("Failed to cancel run: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("Failed to cancel run: {}", response.status()));
-        }
-
-        Ok(())
+    pub async fn get_jobs(&self, owner: &str, repo: &str, run_id: i64) -> Result<Vec<Job>, String> {
+        let response: JobsResponse = self
+            .send_json(
+                self.client
+                    .get(format!("{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/jobs")),
+            )
+            .await?;
+        Ok(response.jobs)
     }
 
-    /// 重新运行成功作业
-    pub async fn rerun_run(&self, owner: &str, repo: &str, run_id: i64) -> Result<(), String> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/actions/runs/{}/rerun",
-            owner, repo, run_id
-        );
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("Failed to rerun run: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("Failed to rerun run: {}", response.status()));
-        }
-
-        Ok(())
-    }
-
-    /// 重新运行失败的作业
-    pub async fn rerun_failed_jobs(&self, owner: &str, repo: &str, run_id: i64) -> Result<(), String> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/actions/runs/{}/rerun-failed-jobs",
-            owner, repo, run_id
-        );
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("Failed to rerun failed jobs: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("Failed to rerun failed jobs: {}", response.status()));
-        }
-
-        Ok(())
-    }
-
-    /// 获取作业的日志
     pub async fn get_job_logs(&self, owner: &str, repo: &str, job_id: i64) -> Result<String, String> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/actions/jobs/{}/logs",
-            owner, repo, job_id
-        );
-
         let response = self
             .client
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .get(&url)
-            .headers(self.headers())
+            .get(format!("{API_BASE}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs"))
             .send()
             .await
-            .map_err(|e| format!("Failed to get logs: {}", e))?;
+            .map_err(|err| err.to_string())?;
 
-        if !response.status().is_success() {
-            return Err(format!("Failed to get logs: {}", response.status()));
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("GitHub API error {status}: {body}"));
         }
 
-        Ok(response.text().await.unwrap_or_default())
+        response.text().await.map_err(|err| err.to_string())
     }
 
-    /// 获取运行产生的制品列表
     pub async fn get_artifacts(
         &self,
         owner: &str,
         repo: &str,
         run_id: i64,
     ) -> Result<Vec<Artifact>, String> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/actions/runs/{}/artifacts",
-            owner, repo, run_id
-        );
-
-        let response = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("Failed to get artifacts: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("GitHub API error: {}", response.status()));
-        }
-
-        let data: serde_json::Value = response.json().await.unwrap_or_default();
-        let artifacts: Vec<Artifact> = data
-            .get("artifacts")
-            .and_then(|a| a.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|a| serde_json::from_value(a).ok())
-            .collect();
-
-        Ok(artifacts)
+        let response: ArtifactListResponse = self
+            .send_json(
+                self.client
+                    .get(format!("{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts")),
+            )
+            .await?;
+        Ok(response.artifacts)
     }
 
-    /// 下载制品
-    pub async fn download_artifact(
+    pub async fn get_job_summaries(
         &self,
-        artifact_url: &str,
-        output_path: &str,
-    ) -> Result<(), String> {
-        let response = self
-            .client
-            .get(artifact_url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("Failed to download artifact: {}", e))?;
+        owner: &str,
+        repo: &str,
+        run_id: i64,
+        head_sha: &str,
+        job_names: &[String],
+        check_suite_id: Option<i64>,
+    ) -> Result<Vec<JobSummary>, String> {
+        let mut check_runs = Vec::new();
 
-        if !response.status().is_success() {
-            return Err(format!("Failed to download artifact: {}", response.status()));
+        if let Some(check_suite_id) = check_suite_id {
+            let response: CheckRunsResponse = self
+                .send_json(
+                    self.client.get(format!(
+                        "{API_BASE}/repos/{owner}/{repo}/check-suites/{check_suite_id}/check-runs?per_page=100"
+                    )),
+                )
+                .await?;
+            check_runs.extend(response.check_runs);
         }
 
-        let bytes = response.bytes().await.map_err(|e| format!("Failed to read bytes: {}", e))?;
-        std::fs::write(output_path, &bytes).map_err(|e| format!("Failed to write file: {}", e))?;
+        if check_runs.is_empty() {
+            let response: CheckRunsResponse = self
+                .send_json(
+                    self.client.get(format!(
+                        "{API_BASE}/repos/{owner}/{repo}/commits/{head_sha}/check-runs?per_page=100&filter=latest"
+                    )),
+                )
+                .await?;
+            check_runs.extend(response.check_runs);
+        }
 
-        Ok(())
+        let summary_runs = check_runs
+            .into_iter()
+            .filter_map(|check_run| {
+                let summary = check_run.output.summary.unwrap_or_default().trim().to_string();
+                let text = check_run.output.text.and_then(|value| {
+                    let trimmed = value.trim().to_string();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                });
+
+                if summary.is_empty() && text.is_none() {
+                    return None;
+                }
+
+                Some(JobSummary {
+                    id: check_run.id,
+                    name: check_run.name,
+                    conclusion: check_run.conclusion,
+                    summary,
+                    text,
+                    details_url: check_run.details_url,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let matched_runs = summary_runs
+            .iter()
+            .filter(|check_run| {
+                let matches_run_url = check_run
+                    .details_url
+                    .as_deref()
+                    .map(|url| url.contains(&format!("/actions/runs/{run_id}")))
+                    .unwrap_or(false);
+                let matches_job_name = job_names.iter().any(|job_name| job_name == &check_run.name);
+                matches_run_url || matches_job_name
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if matched_runs.is_empty() {
+            Ok(summary_runs)
+        } else {
+            Ok(matched_runs)
+        }
+    }
+
+    pub async fn cancel_run(&self, owner: &str, repo: &str, run_id: i64) -> Result<(), String> {
+        self.send_unit(
+            self.client.post(format!(
+                "{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/cancel"
+            )),
+        )
+        .await
+    }
+
+    pub async fn rerun_run(&self, owner: &str, repo: &str, run_id: i64) -> Result<(), String> {
+        self.send_unit(
+            self.client.post(format!(
+                "{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/rerun"
+            )),
+        )
+        .await
+    }
+
+    pub async fn rerun_failed_jobs(
+        &self,
+        owner: &str,
+        repo: &str,
+        run_id: i64,
+    ) -> Result<(), String> {
+        self.send_unit(
+            self.client.post(format!(
+                "{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs"
+            )),
+        )
+        .await
+    }
+
+    pub async fn download_artifact_bytes(
+        &self,
+        owner: &str,
+        repo: &str,
+        artifact_id: i64,
+    ) -> Result<Vec<u8>, String> {
+        let response = self
+            .client
+            .get(format!(
+                "{API_BASE}/repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip"
+            ))
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("GitHub API error {status}: {body}"));
+        }
+
+        response
+            .bytes()
+            .await
+            .map(|value| value.to_vec())
+            .map_err(|err| err.to_string())
+    }
+}
+
+fn mapping_get<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a YamlValue> {
+    mapping.get(YamlValue::String(key.to_string()))
+}
+
+fn yaml_scalar_to_string(value: &YamlValue) -> String {
+    match value {
+        YamlValue::Bool(value) => value.to_string(),
+        YamlValue::Number(value) => value.to_string(),
+        YamlValue::String(value) => value.clone(),
+        _ => serde_json::to_string(&yaml_value_to_json(value)).unwrap_or_default(),
+    }
+}
+
+fn yaml_value_to_json(value: &YamlValue) -> Value {
+    match value {
+        YamlValue::Bool(value) => Value::Bool(*value),
+        YamlValue::Number(value) => {
+            if let Some(int) = value.as_i64() {
+                json!(int)
+            } else if let Some(float) = value.as_f64() {
+                json!(float)
+            } else {
+                Value::Null
+            }
+        }
+        YamlValue::String(value) => Value::String(value.clone()),
+        YamlValue::Sequence(values) => {
+            Value::Array(values.iter().map(yaml_value_to_json).collect::<Vec<_>>())
+        }
+        YamlValue::Mapping(mapping) => {
+            let mut object = Map::new();
+            for (key, value) in mapping {
+                if let Some(key) = key.as_str() {
+                    object.insert(key.to_string(), yaml_value_to_json(value));
+                }
+            }
+            Value::Object(object)
+        }
+        _ => Value::Null,
+    }
+}
+
+pub fn flatten_logs(jobs: &[Job], job_logs: &[(i64, String)]) -> String {
+    let mut output = String::new();
+
+    for job in jobs {
+        output.push_str(&format!("## Job: {}\n", job.name));
+        output.push_str(&format!("status={} conclusion={:?}\n", job.status, job.conclusion));
+
+        if let Some((_, logs)) = job_logs.iter().find(|(job_id, _)| *job_id == job.id) {
+            output.push_str(logs);
+        } else {
+            for Step { name, status, conclusion, .. } in &job.steps {
+                output.push_str(&format!(
+                    "- step={} status={:?} conclusion={:?}\n",
+                    name, status, conclusion
+                ));
+            }
+        }
+
+        output.push('\n');
+    }
+
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{flatten_logs, GitHubClient};
+    use crate::models::{Job, Step};
+
+    #[test]
+    fn parses_workflow_dispatch_inputs() {
+        let yaml = r#"
+name: test
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deploy environment
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+        default: dev
+      canary:
+        required: false
+        type: boolean
+        default: true
+"#;
+
+        let inputs = GitHubClient::parse_workflow_inputs(yaml).unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].name, "environment");
+        assert_eq!(inputs[0].options, vec!["dev".to_string(), "prod".to_string()]);
+        assert_eq!(inputs[1].default_value.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn flattens_logs_with_fallback_steps() {
+        let jobs = vec![Job {
+            id: 3,
+            run_id: 1,
+            name: "lint".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            started_at: None,
+            completed_at: None,
+            html_url: None,
+            steps: vec![Step {
+                name: "install".into(),
+                status: Some("completed".into()),
+                conclusion: Some("success".into()),
+                number: Some(1),
+                started_at: None,
+                completed_at: None,
+            }],
+        }];
+
+        let text = flatten_logs(&jobs, &[]);
+        assert!(text.contains("install"));
     }
 }
