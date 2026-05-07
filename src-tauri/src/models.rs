@@ -37,6 +37,11 @@ pub struct Repository {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Branch {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workflow {
     pub id: i64,
     pub name: String,
@@ -80,6 +85,7 @@ pub struct Run {
     pub display_title: Option<String>,
     pub event: Option<String>,
     pub run_attempt: Option<i64>,
+    pub check_suite_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +123,16 @@ pub struct Artifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobSummary {
+    pub id: i64,
+    pub name: String,
+    pub conclusion: Option<String>,
+    pub summary: String,
+    pub text: Option<String>,
+    pub details_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub id: String,
     pub action: String,
@@ -133,7 +149,7 @@ pub struct RunBundle {
     pub jobs: Vec<Job>,
     pub artifacts: Vec<Artifact>,
     pub log_text: String,
-    pub summary_lines: Vec<String>,
+    pub job_summaries: Vec<JobSummary>,
     pub audit_entries: Vec<AuditEntry>,
 }
 

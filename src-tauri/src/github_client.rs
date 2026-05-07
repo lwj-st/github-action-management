@@ -1,4 +1,4 @@
-use crate::models::{Artifact, Job, Repository, Run, Step, Workflow, WorkflowInput};
+use crate::models::{Artifact, Branch, Job, JobSummary, Repository, Run, Step, Workflow, WorkflowInput};
 use base64::Engine;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
@@ -26,6 +26,31 @@ struct JobsResponse {
 #[derive(Debug, Deserialize)]
 struct ArtifactListResponse {
     artifacts: Vec<Artifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchListItem {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRunsResponse {
+    check_runs: Vec<CheckRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRun {
+    id: i64,
+    name: String,
+    conclusion: Option<String>,
+    details_url: Option<String>,
+    output: CheckRunOutput,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CheckRunOutput {
+    summary: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +148,38 @@ impl GitHubClient {
         }
 
         Ok(repositories)
+    }
+
+    pub async fn get_branches(&self, owner: &str, repo: &str) -> Result<Vec<Branch>, String> {
+        let mut page = 1;
+        let mut branches = Vec::new();
+
+        loop {
+            let page_result: Vec<BranchListItem> = self
+                .send_json(
+                    self.client
+                        .get(format!("{API_BASE}/repos/{owner}/{repo}/branches?per_page=100&page={page}")),
+                )
+                .await?;
+            let page_len = page_result.len();
+
+            if page_result.is_empty() {
+                break;
+            }
+
+            branches.extend(
+                page_result
+                    .into_iter()
+                    .map(|branch| Branch { name: branch.name }),
+            );
+
+            if page_len < 100 {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(branches)
     }
 
     pub async fn get_workflows(&self, owner: &str, repo: &str) -> Result<Vec<Workflow>, String> {
@@ -285,10 +342,13 @@ impl GitHubClient {
         status: Option<&str>,
         per_page: i32,
     ) -> Result<Vec<Run>, String> {
-        let mut url = format!("{API_BASE}/repos/{owner}/{repo}/actions/runs?per_page={per_page}");
-        if let Some(workflow_id) = workflow_id {
-            url.push_str(&format!("&workflow_id={workflow_id}"));
-        }
+        let mut url = if let Some(workflow_id) = workflow_id {
+            format!(
+                "{API_BASE}/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs?per_page={per_page}"
+            )
+        } else {
+            format!("{API_BASE}/repos/{owner}/{repo}/actions/runs?per_page={per_page}")
+        };
         if let Some(branch) = branch {
             url.push_str(&format!("&branch={branch}"));
         }
@@ -348,6 +408,88 @@ impl GitHubClient {
             )
             .await?;
         Ok(response.artifacts)
+    }
+
+    pub async fn get_job_summaries(
+        &self,
+        owner: &str,
+        repo: &str,
+        run_id: i64,
+        head_sha: &str,
+        job_names: &[String],
+        check_suite_id: Option<i64>,
+    ) -> Result<Vec<JobSummary>, String> {
+        let mut check_runs = Vec::new();
+
+        if let Some(check_suite_id) = check_suite_id {
+            let response: CheckRunsResponse = self
+                .send_json(
+                    self.client.get(format!(
+                        "{API_BASE}/repos/{owner}/{repo}/check-suites/{check_suite_id}/check-runs?per_page=100"
+                    )),
+                )
+                .await?;
+            check_runs.extend(response.check_runs);
+        }
+
+        if check_runs.is_empty() {
+            let response: CheckRunsResponse = self
+                .send_json(
+                    self.client.get(format!(
+                        "{API_BASE}/repos/{owner}/{repo}/commits/{head_sha}/check-runs?per_page=100&filter=latest"
+                    )),
+                )
+                .await?;
+            check_runs.extend(response.check_runs);
+        }
+
+        let summary_runs = check_runs
+            .into_iter()
+            .filter_map(|check_run| {
+                let summary = check_run.output.summary.unwrap_or_default().trim().to_string();
+                let text = check_run.output.text.and_then(|value| {
+                    let trimmed = value.trim().to_string();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                });
+
+                if summary.is_empty() && text.is_none() {
+                    return None;
+                }
+
+                Some(JobSummary {
+                    id: check_run.id,
+                    name: check_run.name,
+                    conclusion: check_run.conclusion,
+                    summary,
+                    text,
+                    details_url: check_run.details_url,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let matched_runs = summary_runs
+            .iter()
+            .filter(|check_run| {
+                let matches_run_url = check_run
+                    .details_url
+                    .as_deref()
+                    .map(|url| url.contains(&format!("/actions/runs/{run_id}")))
+                    .unwrap_or(false);
+                let matches_job_name = job_names.iter().any(|job_name| job_name == &check_run.name);
+                matches_run_url || matches_job_name
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if matched_runs.is_empty() {
+            Ok(summary_runs)
+        } else {
+            Ok(matched_runs)
+        }
     }
 
     pub async fn cancel_run(&self, owner: &str, repo: &str, run_id: i64) -> Result<(), String> {
@@ -453,38 +595,6 @@ fn yaml_value_to_json(value: &YamlValue) -> Value {
     }
 }
 
-pub fn summarize_run(run: &Run, jobs: &[Job], artifacts: &[Artifact]) -> Vec<String> {
-    let mut summary = Vec::new();
-    summary.push(format!(
-        "状态：{}{}",
-        run.status,
-        run.conclusion
-            .as_ref()
-            .map(|value| format!(" / {value}"))
-            .unwrap_or_default()
-    ));
-    summary.push(format!("分支：{}，SHA：{}", run.head_branch, run.head_sha));
-    summary.push(format!("Job 数：{}，制品数：{}", jobs.len(), artifacts.len()));
-
-    if let Some(failed_job) = jobs.iter().find(|job| job.conclusion.as_deref() == Some("failure")) {
-        summary.push(format!("失败 Job：{}", failed_job.name));
-    }
-
-    if artifacts.is_empty() {
-        summary.push("当前运行没有产出 artifacts。".to_string());
-    } else {
-        let artifact_names = artifacts
-            .iter()
-            .take(3)
-            .map(|artifact| artifact.name.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
-        summary.push(format!("制品预览：{artifact_names}"));
-    }
-
-    summary
-}
-
 pub fn flatten_logs(jobs: &[Job], job_logs: &[(i64, String)]) -> String {
     let mut output = String::new();
 
@@ -511,8 +621,8 @@ pub fn flatten_logs(jobs: &[Job], job_logs: &[(i64, String)]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{flatten_logs, summarize_run, GitHubClient};
-    use crate::models::{Artifact, Job, Run, Step};
+    use super::{flatten_logs, GitHubClient};
+    use crate::models::{Job, Step};
 
     #[test]
     fn parses_workflow_dispatch_inputs() {
@@ -540,48 +650,6 @@ on:
         assert_eq!(inputs[0].name, "environment");
         assert_eq!(inputs[0].options, vec!["dev".to_string(), "prod".to_string()]);
         assert_eq!(inputs[1].default_value.as_deref(), Some("true"));
-    }
-
-    #[test]
-    fn summarizes_run_bundle() {
-        let run = Run {
-            id: 1,
-            name: "CI".into(),
-            status: "completed".into(),
-            conclusion: Some("failure".into()),
-            created_at: "2026-05-03T00:00:00Z".into(),
-            updated_at: "2026-05-03T00:01:00Z".into(),
-            html_url: "https://example.com".into(),
-            head_branch: "main".into(),
-            head_sha: "abc".into(),
-            workflow_id: 1,
-            display_title: None,
-            event: Some("workflow_dispatch".into()),
-            run_attempt: Some(1),
-        };
-        let jobs = vec![Job {
-            id: 1,
-            run_id: 1,
-            name: "tests".into(),
-            status: "completed".into(),
-            conclusion: Some("failure".into()),
-            started_at: None,
-            completed_at: None,
-            html_url: None,
-            steps: vec![],
-        }];
-        let artifacts = vec![Artifact {
-            id: 1,
-            name: "trace.zip".into(),
-            size_in_bytes: 20,
-            archive_download_url: "https://example.com".into(),
-            expired: false,
-            created_at: "2026-05-03T00:00:00Z".into(),
-            expires_at: None,
-        }];
-
-        let summary = summarize_run(&run, &jobs, &artifacts);
-        assert!(summary.iter().any(|line| line.contains("失败 Job")));
     }
 
     #[test]

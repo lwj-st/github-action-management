@@ -2,7 +2,7 @@
 
 跨平台 GitHub Actions 桌面工作台，基于 `Tauri + React + TypeScript + Rust`。当前版本重点完成这些真实可用能力：
 
-- 多账户接入，Token 使用系统钥匙串保存，不落盘明文
+- 多账户接入，Token 使用本地 SQLite 数据库文件保存
 - 仓库检索与 Workflow 列表拉取
 - 读取仓库内 workflow YAML，解析 `workflow_dispatch.inputs`
 - 触发 workflow、刷新运行记录、取消运行、重跑全部、重跑失败 Job
@@ -15,7 +15,7 @@
 
 - 前端：`React 18`、`TypeScript`、`Vite`
 - 桌面容器：`Tauri 1`
-- 后端：`Rust`、`reqwest`、`serde_yaml`、`keyring`
+- 后端：`Rust`、`reqwest`、`serde_yaml`、`rusqlite`
 - 测试：`Vitest`、`cargo test`
 
 ## 本地开发
@@ -63,7 +63,7 @@ npm run tauri:dev
 ### 2. 选择仓库
 
 - 选择账户后，应用会拉取当前账户可访问仓库
-- 可按 `仓库名 / Owner / 语言` 搜索
+- 可按 `仓库名` 搜索
 
 ### 3. 触发 Workflow
 
@@ -71,7 +71,7 @@ npm run tauri:dev
 - 选择一个支持 `workflow_dispatch` 的 workflow
 - 填写 `Ref / Branch / SHA`
 - 填写动态解析出的参数表单
-- 点击右上角 `立即触发`
+- 在参数区底部点击 `立即触发`
 
 ### 4. 查看运行详情
 
@@ -100,24 +100,28 @@ npm run tauri:dev
 ### macOS
 
 ```bash
+npm run tauri:build:mac
+```
+
+构建成功后，发版分发产物位于：
+
+- `src-tauri/target/release/bundle/dmg/*.dmg`
+
+如果你只想本地直接运行 `.app` 做调试，也可以执行：
+
+```bash
 npm run tauri:build
 ```
 
-构建成功后，直接可执行的应用位于：
+对应应用位于：
 
 - [GitHub Action Management.app](/Users/liwenjian1.vendor/Documents/New%20project/github-action-management/src-tauri/target/release/bundle/macos/GitHub%20Action%20Management.app)
 
 说明：
 
 - 这是 macOS `.app`，可以直接双击运行
-- 当前默认只打 `app` 包，不再默认打 `dmg`
-- 如果后续需要签名、公证、DMG，再补证书和打包流程
-
-也可以只构建 macOS 发版包：
-
-```bash
-npm run tauri:build:mac
-```
+- Release 分发现在改为 `.dmg`
+- 如果后续需要签名和公证，再补证书与 notarization 流程
 
 ### Windows
 
@@ -170,7 +174,7 @@ git push origin v1.0.1
 
 触发后会执行：
 
-- macOS 构建并上传 `GitHub-Action-Management-macos-aarch64.zip`
+- macOS 构建并上传 `.dmg`
 - Windows 构建并上传 `NSIS .exe` 安装器
 
 工作流文件：
@@ -181,7 +185,7 @@ git push origin v1.0.1
 
 以后你可以直接让用户去仓库的 `Releases` 页面下载：
 
-- macOS：下载 `.zip`，解压后得到 `.app`
+- macOS：下载 `.dmg`，打开后拖入 `Applications`
 - Windows：下载 `.exe` 安装器，直接安装
 
 ### 发版前建议
@@ -196,7 +200,12 @@ git push origin v1.0.1
 ## 当前限制
 
 - Workflow Summary 目前基于 Run / Job / Artifact 信息聚合，不是直接读取 `GITHUB_STEP_SUMMARY` 原文
-- 默认通过系统钥匙串保存 Token，首次访问时系统可能弹出权限提示
+- Token 默认保存到本地 SQLite 数据库文件，不再依赖系统钥匙串
+- macOS 与 Windows 统一使用同一套本地数据库存储逻辑，避免因钥匙串/凭据管理器权限导致无法添加账户
+- Token 数据库位置：
+  - macOS: `~/Library/Application Support/github-action-management/tokens.db`
+  - Windows: `%APPDATA%/github-action-management/tokens.db`
+- 当前实现侧重可用性，Token 会写入本地 SQLite 文件；如果后续需要更强保护，可以再加主密码或文件级加密
 - PDF 导出尚未接入，当前导出格式为 `Markdown` 和 `JSON`
 
 ## 目录说明

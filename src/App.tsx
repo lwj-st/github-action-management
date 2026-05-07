@@ -27,7 +27,6 @@ interface BootstrapData {
   accounts: AccountSummary[]
   selected_account_id: string | null
   selected_repo_full_name: string | null
-  audit_entries: AuditEntry[]
 }
 
 interface Repository {
@@ -82,6 +81,7 @@ interface Run {
   display_title?: string | null
   event?: string | null
   run_attempt?: number | null
+  check_suite_id?: number | null
 }
 
 interface Step {
@@ -115,12 +115,21 @@ interface Artifact {
   expires_at: string | null
 }
 
+interface JobSummary {
+  id: number
+  name: string
+  conclusion: string | null
+  summary: string
+  text: string | null
+  details_url: string | null
+}
+
 interface RunBundle {
   run: Run
   jobs: Job[]
   artifacts: Artifact[]
   log_text: string
-  summary_lines: string[]
+  job_summaries: JobSummary[]
   audit_entries: AuditEntry[]
 }
 
@@ -141,7 +150,6 @@ interface ExportResponse {
 type InvokeArgs = Record<string, unknown> | undefined
 
 const THEME_STORAGE_KEY = 'gham-theme-mode'
-const PRESET_STORAGE_KEY = 'gham-local-presets'
 
 const statusTone: Record<string, string> = {
   queued: 'queued',
@@ -167,28 +175,46 @@ function toLocalTime(value: string | null | undefined) {
   return parsed.toLocaleString('zh-CN', { hour12: false })
 }
 
-function storageKeyForWorkflow(workflowId: number) {
-  return `${PRESET_STORAGE_KEY}:${workflowId}`
+function splitLogSections(logText: string) {
+  if (!logText.trim()) {
+    return []
+  }
+
+  const sections = logText
+    .split(/^## Job:\s+/m)
+    .map((chunk) => chunk.trim())
+    .filter(Boolean)
+
+  if (sections.length <= 1 && !logText.includes('## Job:')) {
+    return [{ title: '运行日志', body: logText.trim() }]
+  }
+
+  return sections.map((section, index) => {
+    const [titleLine, ...rest] = section.split('\n')
+    return {
+      title: titleLine?.trim() || `Job ${index + 1}`,
+      body: rest.join('\n').trim(),
+    }
+  })
 }
 
-function readWorkflowPresets(workflowId: number): Array<{ name: string; ref: string; values: Record<string, FormValue> }> {
-  const raw = window.localStorage.getItem(storageKeyForWorkflow(workflowId))
-  if (!raw) {
-    return []
+function ellipsize(value: string | null | undefined, max = 88) {
+  const text = (value ?? '').trim()
+  if (!text) {
+    return ''
   }
-  try {
-    return JSON.parse(raw) as Array<{ name: string; ref: string; values: Record<string, FormValue> }>
-  } catch {
-    return []
+  if (text.length <= max) {
+    return text
   }
+  return `${text.slice(0, max - 1)}…`
 }
 
 function App() {
   const [themeMode, setThemeMode] = useState<ThemeMode>('system')
   const [bootstrapped, setBootstrapped] = useState(false)
   const [accounts, setAccounts] = useState<AccountSummary[]>([])
-  const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([])
   const [repositories, setRepositories] = useState<Repository[]>([])
+  const [branches, setBranches] = useState<string[]>([])
   const [workflows, setWorkflows] = useState<WorkflowDetails[]>([])
   const [runs, setRuns] = useState<Run[]>([])
   const [runBundle, setRunBundle] = useState<RunBundle | null>(null)
@@ -197,7 +223,6 @@ function App() {
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<number | null>(null)
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null)
   const [repoQuery, setRepoQuery] = useState('')
-  const [runFilter, setRunFilter] = useState<'all' | 'queued' | 'in_progress' | 'completed' | 'cancelled'>('all')
   const [selectedRef, setSelectedRef] = useState('')
   const [formValues, setFormValues] = useState<Record<string, FormValue>>({})
   const [showAddAccount, setShowAddAccount] = useState(false)
@@ -206,6 +231,7 @@ function App() {
   const [loadingLabel, setLoadingLabel] = useState('')
   const [toast, setToast] = useState('')
   const [error, setError] = useState('')
+  const [triggerFlash, setTriggerFlash] = useState(false)
 
   useEffect(() => {
     const storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY) as ThemeMode | null
@@ -219,12 +245,19 @@ function App() {
     window.localStorage.setItem(THEME_STORAGE_KEY, themeMode)
   }, [themeMode])
 
+  useEffect(() => {
+    if (!triggerFlash) {
+      return
+    }
+    const timer = window.setTimeout(() => setTriggerFlash(false), 900)
+    return () => window.clearTimeout(timer)
+  }, [triggerFlash])
+
   async function bootstrap() {
     setLoadingLabel('加载本地账户与审计记录')
     try {
       const data = await safeInvoke<BootstrapData>('bootstrap_app')
       setAccounts(data.accounts)
-      setAuditEntries(data.audit_entries)
       setSelectedAccountId(data.selected_account_id ?? data.accounts[0]?.id ?? null)
       setSelectedRepoFullName(data.selected_repo_full_name)
       setBootstrapped(true)
@@ -254,6 +287,7 @@ function App() {
     } catch (err) {
       setError(String(err))
       setRepositories([])
+      setBranches([])
     } finally {
       setLoadingLabel('')
     }
@@ -262,33 +296,61 @@ function App() {
   useEffect(() => {
     if (!selectedAccountId) {
       setRepositories([])
+      setBranches([])
       return
     }
     void loadRepositories(selectedAccountId)
   }, [selectedAccountId])
 
   async function loadRepoData(accountId: string, repoFullName: string, reference?: string) {
-    setLoadingLabel('同步 workflow 与运行记录')
+    setLoadingLabel('同步 workflow')
     setError('')
     try {
-      const [nextWorkflows, nextRuns] = await Promise.all([
+      const [nextWorkflows, nextBranches] = await Promise.all([
         safeInvoke<WorkflowDetails[]>('fetch_workflows', {
           accountId,
           repoFullName,
           reference,
         }),
-        safeInvoke<Run[]>('fetch_runs', { accountId, repoFullName, limit: 40 }),
+        safeInvoke<string[]>('fetch_branches', {
+          accountId,
+          repoFullName,
+        })
       ])
       setWorkflows(nextWorkflows)
-      setRuns(nextRuns)
+      setBranches(nextBranches)
       setSelectedWorkflowId(nextWorkflows[0]?.workflow.id ?? null)
-      setSelectedRunId(nextRuns[0]?.id ?? null)
+      setRuns([])
+      setSelectedRunId(null)
       setRunBundle(null)
     } catch (err) {
       setError(String(err))
       setWorkflows([])
+      setBranches([])
       setRuns([])
+      setSelectedWorkflowId(null)
+      setSelectedRunId(null)
       setRunBundle(null)
+    } finally {
+      setLoadingLabel('')
+    }
+  }
+
+  async function loadRuns(accountId: string, repoFullName: string) {
+    setLoadingLabel('同步运行记录')
+    setError('')
+    try {
+      const nextRuns = await safeInvoke<Run[]>('fetch_runs', {
+        accountId,
+        repoFullName,
+        limit: 40,
+      })
+      setRuns(nextRuns)
+      setSelectedRunId(nextRuns[0]?.id ?? null)
+    } catch (err) {
+      setError(String(err))
+      setRuns([])
+      setSelectedRunId(null)
     } finally {
       setLoadingLabel('')
     }
@@ -297,7 +359,10 @@ function App() {
   useEffect(() => {
     if (!selectedAccountId || !selectedRepoFullName) {
       setWorkflows([])
+      setBranches([])
       setRuns([])
+      setSelectedWorkflowId(null)
+      setSelectedRunId(null)
       setRunBundle(null)
       return
     }
@@ -305,6 +370,16 @@ function App() {
     void safeInvoke('set_selected_repository', { repoFullName: selectedRepoFullName }).catch(() => undefined)
     void loadRepoData(selectedAccountId, selectedRepoFullName, selectedRepo?.default_branch)
   }, [repositories, selectedAccountId, selectedRepoFullName])
+
+  useEffect(() => {
+    if (!selectedAccountId || !selectedRepoFullName) {
+      setRuns([])
+      setSelectedRunId(null)
+      return
+    }
+
+    void loadRuns(selectedAccountId, selectedRepoFullName)
+  }, [selectedAccountId, selectedRepoFullName])
 
   useEffect(() => {
     if (!selectedAccountId || !selectedRepoFullName || !selectedRunId) {
@@ -367,29 +442,9 @@ function App() {
       return repositories
     }
     return repositories.filter((repo) => {
-      return (
-        normalizeText(repo.full_name).includes(query) ||
-        normalizeText(repo.language ?? '').includes(query) ||
-        normalizeText(repo.owner.login).includes(query)
-      )
+      return normalizeText(repo.name).includes(query)
     })
   }, [repositories, repoQuery])
-
-  const visibleRuns = useMemo(() => {
-    if (runFilter === 'all') {
-      return runs
-    }
-    return runs.filter((run) => run.status === runFilter)
-  }, [runs, runFilter])
-
-  const insights = useMemo(() => {
-    const successCount = runs.filter((run) => run.conclusion === 'success').length
-    return {
-      totalRuns: runs.length,
-      successRate: runs.length === 0 ? 0 : Math.round((successCount / runs.length) * 100),
-      runningCount: runs.filter((run) => run.status === 'in_progress').length,
-    }
-  }, [runs])
 
   async function handleAddAccount() {
     if (!accountName.trim() || !accountToken.trim()) {
@@ -440,20 +495,7 @@ function App() {
     if (!selectedAccountId || !selectedRepoFullName) {
       return
     }
-    setLoadingLabel('刷新运行记录')
-    try {
-      const nextRuns = await safeInvoke<Run[]>('fetch_runs', {
-        accountId: selectedAccountId,
-        repoFullName: selectedRepoFullName,
-        limit: 40,
-      })
-      setRuns(nextRuns)
-      setSelectedRunId(nextRuns[0]?.id ?? null)
-    } catch (err) {
-      setError(String(err))
-    } finally {
-      setLoadingLabel('')
-    }
+    await loadRuns(selectedAccountId, selectedRepoFullName)
   }
 
   async function handleTriggerWorkflow() {
@@ -485,6 +527,10 @@ function App() {
         inputs: formValues,
       })
       setToast(response.message)
+      if (response.run) {
+        setSelectedRunId(response.run.id)
+      }
+      setTriggerFlash(true)
       await refreshRuns()
       await bootstrap()
     } catch (err) {
@@ -557,40 +603,14 @@ function App() {
     }
   }
 
-  function savePreset() {
-    if (!selectedWorkflow) {
-      return
-    }
-    const name = window.prompt('输入预设名称')
-    if (!name) {
-      return
-    }
-    const nextPresets = [
-      ...readWorkflowPresets(selectedWorkflow.workflow.id),
-      { name, ref: selectedRef, values: formValues },
-    ]
-    window.localStorage.setItem(
-      storageKeyForWorkflow(selectedWorkflow.workflow.id),
-      JSON.stringify(nextPresets),
-    )
-    setToast(`已保存预设：${name}`)
-  }
-
-  function applyPreset(index: number) {
-    if (!selectedWorkflow) {
-      return
-    }
-    const presets = readWorkflowPresets(selectedWorkflow.workflow.id)
-    const preset = presets[index]
-    if (!preset) {
-      return
-    }
-    setSelectedRef(preset.ref)
-    setFormValues(preset.values)
-    setToast(`已加载预设：${preset.name}`)
-  }
-
-  const presets = selectedWorkflow ? readWorkflowPresets(selectedWorkflow.workflow.id) : []
+  const logSections = useMemo(
+    () => splitLogSections(runBundle?.log_text ?? ''),
+    [runBundle?.log_text],
+  )
+  const logSectionMap = useMemo(
+    () => new Map(logSections.map((section) => [section.title, section.body])),
+    [logSections],
+  )
 
   if (!bootstrapped) {
     return <div className="shell"><div className="panel">正在启动应用…</div></div>
@@ -598,43 +618,31 @@ function App() {
 
   return (
     <div className="shell">
-      <header className="topbar">
-        <div>
-          <p className="eyebrow">Cross-platform GitHub Actions Desk</p>
-          <h1>GitHub Action Management</h1>
-        </div>
-        <div className="topbar-actions">
-          <div className="theme-toggle" role="tablist" aria-label="Theme mode">
-            {(['system', 'light', 'dark'] as ThemeMode[]).map((mode) => (
-              <button
-                key={mode}
-                className={themeMode === mode ? 'active' : ''}
-                onClick={() => setThemeMode(mode)}
-              >
-                {mode === 'system' ? '跟随系统' : mode === 'light' ? '浅色' : '深色'}
-              </button>
-            ))}
-          </div>
-          <button className="primary-button" onClick={handleTriggerWorkflow} disabled={!selectedWorkflow}>
-            立即触发
-          </button>
-        </div>
-      </header>
-
       {loadingLabel ? <div className="loading-banner">{loadingLabel}</div> : null}
       {error ? <div className="error-banner">{error}</div> : null}
 
       <main className="workspace">
         <aside className="rail">
           <section className="panel account-panel">
-            <div className="section-title">
-              <span>账户与仓库</span>
-              <div className="inline-actions">
-                <span className="pill neutral">{accounts.length} 个账户</span>
-                <button className="ghost-button" onClick={() => setShowAddAccount((value) => !value)}>
-                  {showAddAccount ? '收起' : '添加账户'}
-                </button>
+            <div className="theme-strip">
+              <div className="theme-toggle" role="tablist" aria-label="Theme mode">
+                {(['system', 'light', 'dark'] as ThemeMode[]).map((mode) => (
+                  <button
+                    key={mode}
+                    className={themeMode === mode ? 'active' : ''}
+                    onClick={() => setThemeMode(mode)}
+                  >
+                    {mode === 'system' ? '跟随系统' : mode === 'light' ? '浅色' : '深色'}
+                  </button>
+                ))}
               </div>
+            </div>
+
+            <div className="section-title">
+              <span>账户</span>
+              <button className="ghost-button" onClick={() => setShowAddAccount((value) => !value)}>
+                {showAddAccount ? '收起' : '添加账户'}
+              </button>
             </div>
 
             {showAddAccount ? (
@@ -650,7 +658,7 @@ function App() {
                     value={accountToken}
                     onChange={(event) => setAccountToken(event.target.value)}
                   />
-                  <small>建议最小权限：`repo`、`workflow`、`actions`</small>
+                  <small>建议最小权限：`repo`、`workflow`、`actions`。PAT 会保存到本地数据库文件。</small>
                 </label>
                 <div className="inline-actions">
                   <button className="primary-button" onClick={handleAddAccount}>保存账户</button>
@@ -667,12 +675,9 @@ function App() {
                       setSelectedAccountId(account.id)
                       await safeInvoke('set_current_account', { accountId: account.id }).catch(() => undefined)
                     }}
+                    title={account.name}
                   >
-                    <div>
-                      <strong>{account.name}</strong>
-                      <span>上次使用：{toLocalTime(account.last_used_at)}</span>
-                    </div>
-                    <span className={`dot ${account.token_status}`} />
+                    <strong className="truncate-1">{account.name}</strong>
                   </button>
                   <button className="remove-button" onClick={() => void handleRemoveAccount(account.id)}>
                     移除
@@ -684,7 +689,7 @@ function App() {
             <label className="search-field">
               <span>仓库搜索</span>
               <input
-                placeholder="名称 / Owner / 语言"
+                placeholder="仅按仓库名搜索"
                 value={repoQuery}
                 onChange={(event) => setRepoQuery(event.target.value)}
               />
@@ -696,95 +701,36 @@ function App() {
                   key={repo.id}
                   className={`repo-card ${repo.full_name === selectedRepoFullName ? 'selected' : ''}`}
                   onClick={() => setSelectedRepoFullName(repo.full_name)}
+                  title={repo.full_name}
                 >
-                  <div className="repo-main">
-                    <strong>{repo.name}</strong>
-                    <span>{repo.full_name}</span>
-                  </div>
-                  <div className="repo-meta">
-                    <span className="language-tag">{repo.language ?? 'Unknown'}</span>
-                    <span>{repo.private ? 'private' : 'public'}</span>
-                  </div>
+                  <strong className="repo-name">{repo.name}</strong>
                 </button>
               ))}
             </div>
           </section>
 
-          <section className="panel insights-panel">
-            <div className="section-title">
-              <span>运行洞察</span>
-              <span className="pill info">当前仓库</span>
-            </div>
-            <div className="insight-grid">
-              <article>
-                <span>成功率</span>
-                <strong>{insights.successRate}%</strong>
-              </article>
-              <article>
-                <span>运行中</span>
-                <strong>{insights.runningCount}</strong>
-              </article>
-              <article>
-                <span>总运行数</span>
-                <strong>{insights.totalRuns}</strong>
-              </article>
-            </div>
-          </section>
         </aside>
 
-        <section className="center-column">
-          <section className="panel hero-panel">
-            <div className="hero-copy">
-              <p className="eyebrow">PRD 对齐工作台</p>
-              <h2>{selectedRepository?.full_name ?? '先添加账户并选择仓库'}</h2>
-              <p>
-                已接入真实 GitHub API 调用、系统钥匙串存储和本地审计记录。工作台围绕账户、Workflow Dispatch、运行监控、日志与制品处理展开。
-              </p>
-            </div>
-            <div className="hero-metrics">
-              <div className="metric-card">
-                <span>默认分支</span>
-                <strong>{selectedRepository?.default_branch ?? '-'}</strong>
-              </div>
-              <div className="metric-card">
-                <span>最近更新</span>
-                <strong>{toLocalTime(selectedRepository?.updated_at)}</strong>
-              </div>
-              <div className="metric-card">
-                <span>Workflow 数</span>
-                <strong>{workflows.length}</strong>
-              </div>
-            </div>
-          </section>
-
-          <section className="panel workflow-panel">
+        <section className="panel workflow-panel">
             <div className="section-title">
               <span>Workflow Dispatch</span>
-              <div className="inline-actions">
-                <button className="ghost-button" onClick={savePreset} disabled={!selectedWorkflow}>
-                  保存为预设
-                </button>
-                <button className="ghost-button" onClick={() => void refreshRuns()}>
-                  刷新运行记录
-                </button>
-              </div>
             </div>
 
             <div className="workflow-grid">
-              <div className="workflow-list">
+              <div className="workflow-list scroll-panel">
                 {workflows.length > 0 ? workflows.map((item) => (
                   <button
                     key={item.workflow.id}
                     className={`workflow-card ${item.workflow.id === selectedWorkflowId ? 'selected' : ''}`}
                     onClick={() => setSelectedWorkflowId(item.workflow.id)}
+                    title={item.workflow.name}
                   >
                     <div className="workflow-card-head">
-                      <strong>{item.workflow.name}</strong>
+                      <strong className="truncate-1">{item.workflow.name}</strong>
                       <span className={`pill ${item.workflow.state === 'active' ? 'success' : 'neutral'}`}>
                         {item.workflow.state}
                       </span>
                     </div>
-                    <p>{item.workflow.path}</p>
                     <div className="workflow-card-meta">
                       <span>{item.inputs.length} 个参数</span>
                       <span>{toLocalTime(item.workflow.updated_at)}</span>
@@ -798,80 +744,94 @@ function App() {
                   <>
                     <div className="dispatch-header">
                       <div>
-                        <h3>{selectedWorkflow.workflow.name}</h3>
-                        <p>{selectedWorkflow.workflow.path}</p>
+                        <h3 title={selectedWorkflow.workflow.name}>{selectedWorkflow.workflow.name}</h3>
                       </div>
                       <span className="pill info">{selectedWorkflow.inputs.length} inputs</span>
                     </div>
 
-                    <div className="preset-row">
-                      {presets.length > 0 ? presets.map((preset, index) => (
-                        <button key={`${preset.name}-${index}`} className="preset-chip" onClick={() => applyPreset(index)}>
-                          {preset.name}
-                        </button>
-                      )) : <span className="empty-inline">没有保存的参数预设</span>}
-                    </div>
-
-                    <div className="form-grid">
-                      <label className="field">
-                        <span>Ref / Branch / SHA</span>
-                        <input value={selectedRef} onChange={(event) => setSelectedRef(event.target.value)} />
-                      </label>
-
-                      {selectedWorkflow.inputs.map((input) => (
-                        <label className="field" key={input.name}>
-                          <span>
-                            {input.label}
-                            {input.required ? <em>*</em> : null}
-                          </span>
-                          {input.type === 'boolean' ? (
-                            <label className="switch" htmlFor={input.name}>
-                              <input
-                                id={input.name}
-                                type="checkbox"
-                                checked={Boolean(formValues[input.name])}
-                                onChange={(event) =>
-                                  setFormValues((current) => ({
-                                    ...current,
-                                    [input.name]: event.target.checked,
-                                  }))
-                                }
-                              />
-                              <span className="switch-track" />
-                            </label>
-                          ) : input.options.length > 0 ? (
-                            <select
-                              value={String(formValues[input.name] ?? '')}
-                              onChange={(event) =>
-                                setFormValues((current) => ({
-                                  ...current,
-                                  [input.name]:
-                                    input.type === 'number' ? Number(event.target.value) : event.target.value,
-                                }))
-                              }
-                            >
-                              {input.options.map((option) => (
-                                <option key={option} value={option}>
-                                  {option}
+                    <div className="dispatch-body scroll-panel">
+                      <div className="form-grid">
+                        <label className="field field-span-2">
+                          <span>Ref / Branch / SHA</span>
+                          {branches.length > 0 ? (
+                            <select value={selectedRef} onChange={(event) => setSelectedRef(event.target.value)}>
+                              {branches.map((branch) => (
+                                <option key={branch} value={branch}>
+                                  {branch}
                                 </option>
                               ))}
                             </select>
                           ) : (
-                            <input
-                              type={input.type === 'number' ? 'number' : 'text'}
-                              value={String(formValues[input.name] ?? '')}
-                              onChange={(event) =>
-                                setFormValues((current) => ({
-                                  ...current,
-                                  [input.name]:
-                                    input.type === 'number' ? Number(event.target.value) : event.target.value,
-                                }))
-                              }
-                            />
+                            <input value={selectedRef} onChange={(event) => setSelectedRef(event.target.value)} />
                           )}
-                          <small>{input.description ?? `字段类型：${input.type}`}</small>
                         </label>
-                      ))}
+
+                        {selectedWorkflow.inputs.map((input) => (
+                          <label className="field" key={input.name} title={input.description ?? input.label}>
+                            <span>
+                              <span className="truncate-1">{input.label}</span>
+                              {input.required ? <em>*</em> : null}
+                            </span>
+                            {input.type === 'boolean' ? (
+                              <label className="switch" htmlFor={input.name}>
+                                <input
+                                  id={input.name}
+                                  type="checkbox"
+                                  checked={Boolean(formValues[input.name])}
+                                  onChange={(event) =>
+                                    setFormValues((current) => ({
+                                      ...current,
+                                      [input.name]: event.target.checked,
+                                    }))
+                                  }
+                                />
+                                <span className="switch-track" />
+                              </label>
+                            ) : input.options.length > 0 ? (
+                              <select
+                                value={String(formValues[input.name] ?? '')}
+                                onChange={(event) =>
+                                  setFormValues((current) => ({
+                                    ...current,
+                                    [input.name]:
+                                      input.type === 'number' ? Number(event.target.value) : event.target.value,
+                                  }))
+                                }
+                              >
+                                {input.options.map((option) => (
+                                  <option key={option} value={option}>
+                                    {option}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <input
+                                type={input.type === 'number' ? 'number' : 'text'}
+                                value={String(formValues[input.name] ?? '')}
+                                onChange={(event) =>
+                                  setFormValues((current) => ({
+                                    ...current,
+                                    [input.name]:
+                                      input.type === 'number' ? Number(event.target.value) : event.target.value,
+                                  }))
+                                }
+                              />
+                            )}
+                            <small title={input.description ?? `字段类型：${input.type}`}>
+                              {ellipsize(input.description ?? `字段类型：${input.type}`, 72)}
+                            </small>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="dispatch-actions">
+                      <button
+                        className={`primary-button ${triggerFlash ? 'trigger-success' : ''}`}
+                        onClick={handleTriggerWorkflow}
+                        disabled={!selectedWorkflow}
+                      >
+                        立即触发
+                      </button>
                     </div>
                   </>
                 ) : (
@@ -885,37 +845,26 @@ function App() {
             <div className="section-title">
               <span>运行记录</span>
               <div className="inline-actions">
-                {(['all', 'queued', 'in_progress', 'completed', 'cancelled'] as const).map((filter) => (
-                  <button
-                    key={filter}
-                    className={`filter-chip ${runFilter === filter ? 'active' : ''}`}
-                    onClick={() => setRunFilter(filter)}
-                  >
-                    {filter === 'all'
-                      ? '全部'
-                      : filter === 'queued'
-                        ? '排队中'
-                        : filter === 'in_progress'
-                          ? '运行中'
-                          : filter === 'completed'
-                            ? '已完成'
-                            : '已取消'}
-                  </button>
-                ))}
+                <button className="ghost-button" onClick={() => void refreshRuns()} disabled={!selectedRepoFullName}>
+                  刷新运行记录
+                </button>
               </div>
             </div>
 
-            <div className="run-list">
-              {visibleRuns.length > 0 ? visibleRuns.map((run) => (
+            <div className="run-list scroll-panel run-list-compact">
+              {runs.length > 0 ? runs.map((run) => (
                 <button
                   key={run.id}
                   className={`run-card ${run.id === selectedRunId ? 'selected' : ''}`}
                   onClick={() => setSelectedRunId(run.id)}
+                  title={run.display_title ?? run.name}
                 >
                   <div className="run-card-head">
                     <div>
-                      <strong>{run.display_title ?? run.name}</strong>
-                      <span>#{run.id} · {run.head_branch} · {toLocalTime(run.created_at)}</span>
+                      <strong className="truncate-1">{run.display_title ?? run.name}</strong>
+                      <span className="truncate-1" title={`#${run.id} · ${run.head_branch} · ${toLocalTime(run.created_at)}`}>
+                        #{run.id} · {run.head_branch} · {toLocalTime(run.created_at)}
+                      </span>
                     </div>
                     <div className="run-badges">
                       <span className={`status-badge ${statusTone[run.status] ?? 'neutral'}`}>{run.status}</span>
@@ -929,9 +878,7 @@ function App() {
               )) : <div className="empty-state">没有符合筛选条件的运行记录。</div>}
             </div>
           </section>
-        </section>
 
-        <aside className="details-column">
           <section className="panel detail-panel">
             <div className="section-title">
               <span>运行详情</span>
@@ -963,12 +910,25 @@ function App() {
                 </div>
 
                 <div className="detail-block">
-                  <h4>Summary</h4>
-                  <ul>
-                    {runBundle.summary_lines.map((line) => (
-                      <li key={line}>{line}</li>
-                    ))}
-                  </ul>
+                  <h4>GitHub Action Summary</h4>
+                  <div className="summary-list scroll-panel">
+                    {runBundle.job_summaries.length > 0 ? runBundle.job_summaries.map((summary) => (
+                      <article className="summary-card" key={summary.id}>
+                        <div className="summary-card-head">
+                          <strong className="truncate-1" title={summary.name}>{summary.name}</strong>
+                          {summary.conclusion ? (
+                            <span className={`status-badge ${statusTone[summary.conclusion] ?? 'neutral'}`}>
+                              {summary.conclusion}
+                            </span>
+                          ) : null}
+                        </div>
+                        {summary.summary ? <pre>{summary.summary}</pre> : null}
+                        {summary.text ? <pre>{summary.text}</pre> : null}
+                      </article>
+                    )) : (
+                      <div className="empty-state">当前运行没有返回 GitHub Action Summary。</div>
+                    )}
+                  </div>
                   <div className="inline-actions">
                     <button className="ghost-button" onClick={() => void handleExport('markdown')}>导出 Markdown</button>
                     <button className="ghost-button" onClick={() => void handleExport('json')}>导出 JSON</button>
@@ -982,9 +942,11 @@ function App() {
                   <h4>Jobs</h4>
                   <div className="audit-list">
                     {runBundle.jobs.map((job) => (
-                      <article key={job.id}>
-                        <strong>{job.name}</strong>
-                        <span>{job.status} / {job.conclusion ?? 'n/a'} · {job.steps.length} steps</span>
+                      <article key={job.id} title={job.name}>
+                        <strong className="truncate-1">{job.name}</strong>
+                        <span className="truncate-1" title={`${job.status} / ${job.conclusion ?? 'n/a'} · ${job.steps.length} steps`}>
+                          {job.status} / {job.conclusion ?? 'n/a'} · {job.steps.length} steps
+                        </span>
                       </article>
                     ))}
                   </div>
@@ -996,7 +958,7 @@ function App() {
                     {runBundle.artifacts.map((artifact) => (
                       <article className="artifact-card" key={artifact.id}>
                         <div>
-                          <strong>{artifact.name}</strong>
+                          <strong className="truncate-1" title={artifact.name}>{artifact.name}</strong>
                           <span>{Math.max(1, Math.round(artifact.size_in_bytes / 1024))} KB</span>
                         </div>
                         <div className="inline-actions">
@@ -1014,28 +976,35 @@ function App() {
 
                 <div className="detail-block">
                   <h4>实时日志</h4>
-                  <div className="terminal">
-                    {runBundle.log_text || '暂无日志'}
+                  <div className="log-stack scroll-panel">
+                    {runBundle.jobs.length > 0 ? runBundle.jobs.map((job) => (
+                      <article key={job.id} className="log-card">
+                        <header>
+                          <div className="log-card-title">
+                            <strong className="truncate-1" title={job.name}>{job.name}</strong>
+                            <span className={`status-badge ${statusTone[job.conclusion ?? job.status] ?? 'neutral'}`}>
+                              {job.conclusion ?? job.status}
+                            </span>
+                          </div>
+                          <p className="truncate-1" title={job.steps.map((step) => step.name).join(' · ')}>
+                            {job.steps.length > 0
+                              ? job.steps.map((step) => step.name).join(' · ')
+                              : '暂无 step 信息'}
+                          </p>
+                        </header>
+                        <pre>{logSectionMap.get(job.name) || '暂无日志内容'}</pre>
+                      </article>
+                    )) : (
+                      <div className="terminal">暂无日志</div>
+                    )}
                   </div>
                 </div>
 
-                <div className="detail-block">
-                  <h4>审计轨迹</h4>
-                  <div className="audit-list">
-                    {(runBundle.audit_entries.length > 0 ? runBundle.audit_entries : auditEntries.slice(0, 6)).map((entry) => (
-                      <article key={entry.id}>
-                        <strong>{entry.action}</strong>
-                        <span>{entry.message} · {toLocalTime(entry.created_at)}</span>
-                      </article>
-                    ))}
-                  </div>
-                </div>
               </>
             ) : (
               <div className="empty-state">选择一条运行记录后显示详情。</div>
             )}
           </section>
-        </aside>
       </main>
 
       {toast ? (

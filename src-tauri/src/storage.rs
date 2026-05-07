@@ -1,13 +1,13 @@
 use crate::models::{AccountRecord, AuditEntry, StoredState};
 use chrono::{Duration, Utc};
 use dirs::{data_local_dir, download_dir};
-use keyring::Entry;
+use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 use std::path::PathBuf;
 
 const APP_DIR_NAME: &str = "github-action-management";
 const STATE_FILE_NAME: &str = "state.json";
-const KEYRING_SERVICE: &str = "github-action-management";
+const TOKEN_DB_FILE_NAME: &str = "tokens.db";
 
 fn app_dir() -> Result<PathBuf, String> {
     let base = data_local_dir().ok_or("Unable to resolve local data directory")?;
@@ -18,6 +18,26 @@ fn app_dir() -> Result<PathBuf, String> {
 
 fn state_file() -> Result<PathBuf, String> {
     Ok(app_dir()?.join(STATE_FILE_NAME))
+}
+
+fn token_db_file() -> Result<PathBuf, String> {
+    Ok(app_dir()?.join(TOKEN_DB_FILE_NAME))
+}
+
+fn open_token_db() -> Result<Connection, String> {
+    let connection = Connection::open(token_db_file()?).map_err(|err| err.to_string())?;
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS account_tokens (
+              account_id TEXT PRIMARY KEY,
+              token TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            ",
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(connection)
 }
 
 pub fn downloads_dir() -> PathBuf {
@@ -43,32 +63,41 @@ pub fn save_state(state: &StoredState) -> Result<(), String> {
 }
 
 pub fn store_token(account_id: &str, token: &str) -> Result<(), String> {
-    Entry::new(KEYRING_SERVICE, account_id)
-        .map_err(|err| err.to_string())?
-        .set_password(token)
+    open_token_db()?
+        .execute(
+            "
+            INSERT INTO account_tokens (account_id, token, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(account_id) DO UPDATE SET
+              token = excluded.token,
+              updated_at = excluded.updated_at
+            ",
+            params![account_id, token, Utc::now().to_rfc3339()],
+        )
         .map_err(|err| err.to_string())
+        .map(|_| ())
 }
 
 pub fn read_token(account_id: &str) -> Result<String, String> {
-    Entry::new(KEYRING_SERVICE, account_id)
+    open_token_db()?
+        .query_row(
+            "SELECT token FROM account_tokens WHERE account_id = ?1",
+            params![account_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
         .map_err(|err| err.to_string())?
-        .get_password()
-        .map_err(|err| err.to_string())
+        .ok_or("Token not found in local database".to_string())
 }
 
 pub fn delete_token(account_id: &str) -> Result<(), String> {
-    let entry = Entry::new(KEYRING_SERVICE, account_id).map_err(|err| err.to_string())?;
-    match entry.delete_password() {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let message = err.to_string();
-            if message.contains("No entry found") {
-                Ok(())
-            } else {
-                Err(message)
-            }
-        }
-    }
+    open_token_db()?
+        .execute(
+            "DELETE FROM account_tokens WHERE account_id = ?1",
+            params![account_id],
+        )
+        .map_err(|err| err.to_string())
+        .map(|_| ())
 }
 
 pub fn token_status(account: &AccountRecord) -> String {

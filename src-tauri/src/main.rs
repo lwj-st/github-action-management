@@ -3,7 +3,7 @@ mod models;
 mod storage;
 
 use chrono::Utc;
-use github_client::{flatten_logs, summarize_run, GitHubClient};
+use github_client::{flatten_logs, GitHubClient};
 use models::*;
 use serde_json::Value;
 use std::fs;
@@ -49,6 +49,11 @@ async fn build_run_bundle(
     let run = client.get_run(owner, repo, run_id).await?;
     let jobs = client.get_jobs(owner, repo, run_id).await?;
     let artifacts = client.get_artifacts(owner, repo, run_id).await?;
+    let job_names = jobs.iter().map(|job| job.name.clone()).collect::<Vec<_>>();
+    let job_summaries = client
+        .get_job_summaries(owner, repo, run.id, &run.head_sha, &job_names, run.check_suite_id)
+        .await
+        .unwrap_or_default();
 
     let mut collected_logs = Vec::new();
     for job in &jobs {
@@ -58,14 +63,13 @@ async fn build_run_bundle(
     }
 
     let log_text = flatten_logs(&jobs, &collected_logs);
-    let summary_lines = summarize_run(&run, &jobs, &artifacts);
 
     Ok(RunBundle {
         run,
         jobs,
         artifacts,
         log_text,
-        summary_lines,
+        job_summaries,
         audit_entries,
     })
 }
@@ -236,6 +240,22 @@ async fn fetch_workflows(
     }
 
     Ok(detailed)
+}
+
+#[tauri::command]
+async fn fetch_branches(
+    context: tauri::State<'_, AppContext>,
+    account_id: String,
+    repo_full_name: String,
+) -> Result<Vec<String>, String> {
+    let token = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        account_token(&state.stored, &account_id)?
+    };
+    let client = GitHubClient::new(&token)?;
+    let (owner, repo) = split_repo(&repo_full_name)?;
+    let branches = client.get_branches(owner, repo).await?;
+    Ok(branches.into_iter().map(|branch| branch.name).collect())
 }
 
 #[tauri::command]
@@ -503,9 +523,21 @@ async fn export_run_report(
                 "- Conclusion: `{}`\n\n",
                 bundle.run.conclusion.clone().unwrap_or_else(|| "n/a".to_string())
             ));
-            markdown.push_str("## Summary\n");
-            for line in &bundle.summary_lines {
-                markdown.push_str(&format!("- {line}\n"));
+            markdown.push_str("## GitHub Action Summary\n");
+            if bundle.job_summaries.is_empty() {
+                markdown.push_str("- No job summaries were returned by GitHub.\n");
+            } else {
+                for summary in &bundle.job_summaries {
+                    markdown.push_str(&format!("### {}\n\n", summary.name));
+                    if !summary.summary.is_empty() {
+                        markdown.push_str(&summary.summary);
+                        markdown.push_str("\n\n");
+                    }
+                    if let Some(text) = &summary.text {
+                        markdown.push_str(text);
+                        markdown.push_str("\n\n");
+                    }
+                }
             }
             markdown.push_str("\n## Jobs\n");
             for job in &bundle.jobs {
@@ -548,6 +580,7 @@ fn main() {
             set_selected_repository,
             fetch_repositories,
             fetch_workflows,
+            fetch_branches,
             trigger_workflow,
             fetch_runs,
             get_run_bundle,

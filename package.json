@@ -12,7 +12,7 @@
     "tauri": "node scripts/run-tauri.cjs --config tauri.conf.json",
     "tauri:dev": "node scripts/run-tauri.cjs dev --config tauri.conf.json",
     "tauri:build": "node scripts/run-tauri.cjs build --config tauri.conf.json",
-    "tauri:build:mac": "node scripts/run-tauri.cjs build --config tauri.conf.json --bundles app",
+    "tauri:build:mac": "node scripts/build-macos-dmg.cjs",
     "tauri:build:windows": "node scripts/run-tauri.cjs build --config tauri.conf.json --bundles nsis"
   },
   "dependencies": {

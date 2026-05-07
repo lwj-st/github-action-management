@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build-macos:
-    name: Build macOS app
+    name: Build macOS dmg
     runs-on: macos-latest
 
     steps:
@@ -39,17 +39,11 @@ jobs:
       - name: Build macOS bundle
         run: npm run tauri:build:mac
 
-      - name: Zip macOS app
-        run: |
-          ditto -c -k --sequesterRsrc --keepParent \
-            "src-tauri/target/release/bundle/macos/GitHub Action Management.app" \
-            "src-tauri/target/release/bundle/macos/GitHub-Action-Management-macos-aarch64.zip"
-
       - name: Upload macOS release asset
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            src-tauri/target/release/bundle/macos/GitHub-Action-Management-macos-aarch64.zip
+            src-tauri/target/release/bundle/dmg/*.dmg
 
   build-windows:
     name: Build Windows installer
