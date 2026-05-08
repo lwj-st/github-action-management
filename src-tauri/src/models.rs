@@ -123,6 +123,14 @@ pub struct Artifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactPreview {
+    pub artifact_id: i64,
+    pub artifact_name: String,
+    pub entry_path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub id: String,
     pub action: String,
@@ -138,6 +146,7 @@ pub struct RunBundle {
     pub run: Run,
     pub jobs: Vec<Job>,
     pub artifacts: Vec<Artifact>,
+    pub artifact_previews: Vec<ArtifactPreview>,
     pub log_text: String,
     pub audit_entries: Vec<AuditEntry>,
 }
@@ -160,12 +169,18 @@ pub struct DownloadResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DownloadSettings {
+    pub download_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StoredState {
     pub accounts: Vec<AccountRecord>,
     pub selected_account_id: Option<String>,
     pub selected_repo_full_name: Option<String>,
     pub audit_entries: Vec<AuditEntry>,
     pub presets: HashMap<String, serde_json::Value>,
+    pub download_settings: DownloadSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +189,7 @@ pub struct BootstrapData {
     pub selected_account_id: Option<String>,
     pub selected_repo_full_name: Option<String>,
     pub audit_entries: Vec<AuditEntry>,
+    pub download_settings: DownloadSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

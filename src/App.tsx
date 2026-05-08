@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/tauri'
+import { open } from '@tauri-apps/api/dialog'
 import './App.css'
 import { inferDefaultValue, normalizeText, type FormValue } from './lib/workflow-utils'
 
@@ -27,6 +28,7 @@ interface BootstrapData {
   accounts: AccountSummary[]
   selected_account_id: string | null
   selected_repo_full_name: string | null
+  download_settings: DownloadSettings
 }
 
 interface Repository {
@@ -115,10 +117,18 @@ interface Artifact {
   expires_at: string | null
 }
 
+interface ArtifactPreview {
+  artifact_id: number
+  artifact_name: string
+  entry_path: string
+  content: string
+}
+
 interface RunBundle {
   run: Run
   jobs: Job[]
   artifacts: Artifact[]
+  artifact_previews: ArtifactPreview[]
   log_text: string
   audit_entries: AuditEntry[]
 }
@@ -135,6 +145,10 @@ interface DownloadResponse {
 
 interface ExportResponse {
   path: string
+}
+
+interface DownloadSettings {
+  download_dir: string | null
 }
 
 type InvokeArgs = Record<string, unknown> | undefined
@@ -225,6 +239,7 @@ function App() {
   const [showAddAccount, setShowAddAccount] = useState(false)
   const [accountName, setAccountName] = useState('')
   const [accountToken, setAccountToken] = useState('')
+  const [downloadDir, setDownloadDir] = useState('')
   const [loadingLabel, setLoadingLabel] = useState('')
   const [toast, setToast] = useState('')
   const [error, setError] = useState('')
@@ -257,6 +272,7 @@ function App() {
       setAccounts(data.accounts)
       setSelectedAccountId(data.selected_account_id ?? data.accounts[0]?.id ?? null)
       setSelectedRepoFullName(data.selected_repo_full_name)
+      setDownloadDir(data.download_settings.download_dir ?? '')
       setBootstrapped(true)
     } catch (err) {
       setError(String(err))
@@ -305,6 +321,10 @@ function App() {
   async function loadRepoData(accountId: string, repoFullName: string, reference?: string) {
     setLoadingLabel('同步 workflow')
     setError('')
+    setSelectedWorkflowId(null)
+    setRuns([])
+    setSelectedRunId(null)
+    setRunBundle(null)
     try {
       const [nextWorkflows, nextBranches] = await Promise.all([
         safeInvoke<WorkflowDetails[]>('fetch_workflows', {
@@ -336,7 +356,17 @@ function App() {
     }
   }
 
-  async function loadRuns(accountId: string, repoFullName: string, silent = false) {
+  async function loadRuns(
+    accountId: string,
+    repoFullName: string,
+    workflowId: number | null,
+    silent = false,
+  ) {
+    if (!workflowId) {
+      setRuns([])
+      setSelectedRunId(null)
+      return
+    }
     if (!silent) {
       setLoadingLabel('同步运行记录')
       setError('')
@@ -345,6 +375,7 @@ function App() {
       const nextRuns = await safeInvoke<Run[]>('fetch_runs', {
         accountId,
         repoFullName,
+        workflowId,
         limit: 40,
       })
       setRuns(nextRuns)
@@ -411,8 +442,8 @@ function App() {
       return
     }
 
-    void loadRuns(selectedAccountId, selectedRepoFullName)
-  }, [selectedAccountId, selectedRepoFullName])
+    void loadRuns(selectedAccountId, selectedRepoFullName, selectedWorkflowId)
+  }, [selectedAccountId, selectedRepoFullName, selectedWorkflowId])
 
   useEffect(() => {
     if (!selectedAccountId || !selectedRepoFullName || !selectedRunId) {
@@ -442,12 +473,12 @@ function App() {
     }
 
     const timer = window.setInterval(() => {
-      void loadRuns(selectedAccountId, selectedRepoFullName, true)
+      void loadRuns(selectedAccountId, selectedRepoFullName, selectedWorkflowId, true)
       void fetchRunBundle(selectedAccountId, selectedRepoFullName, selectedRunId, true)
     }, 4000)
 
     return () => window.clearInterval(timer)
-  }, [selectedAccountId, selectedRepoFullName, selectedRunId, runBundle?.run.status])
+  }, [selectedAccountId, selectedRepoFullName, selectedRunId, selectedWorkflowId, runBundle?.run.status])
 
   const selectedRepository =
     repositories.find((repo) => repo.full_name === selectedRepoFullName) ?? null
@@ -528,7 +559,38 @@ function App() {
     if (!selectedAccountId || !selectedRepoFullName) {
       return
     }
-    await loadRuns(selectedAccountId, selectedRepoFullName)
+    await loadRuns(selectedAccountId, selectedRepoFullName, selectedWorkflowId)
+  }
+
+  async function handleSaveDownloadSettings() {
+    setLoadingLabel('保存下载路径配置')
+    setError('')
+    try {
+      const settings = await safeInvoke<DownloadSettings>('update_download_settings', {
+        downloadDir,
+      })
+      setDownloadDir(settings.download_dir ?? '')
+      setToast('下载路径已保存')
+    } catch (err) {
+      setError(String(err))
+    } finally {
+      setLoadingLabel('')
+    }
+  }
+
+  async function handlePickDownloadDir() {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: downloadDir || undefined,
+      })
+      if (typeof selected === 'string') {
+        setDownloadDir(selected)
+      }
+    } catch (err) {
+      setError(String(err))
+    }
   }
 
   async function handleTriggerWorkflow() {
@@ -644,6 +706,7 @@ function App() {
     () => new Map(logSections.map((section) => [section.title, section.body])),
     [logSections],
   )
+  const activeArtifactPreview = runBundle?.artifact_previews[0] ?? null
 
   if (!bootstrapped) {
     return <div className="shell"><div className="panel">正在启动应用…</div></div>
@@ -751,6 +814,29 @@ function App() {
                   <strong className="repo-name">{repo.name}</strong>
                 </button>
               ))}
+            </div>
+
+            <div className="download-settings">
+              <div className="section-title compact">
+                <span>下载路径</span>
+              </div>
+              <label className="field">
+                <span>统一下载目录</span>
+                <input
+                  {...plainTextInputProps}
+                  placeholder="默认：Downloads/github-actions-artifacts"
+                  value={downloadDir}
+                  onChange={(event) => setDownloadDir(event.target.value)}
+                />
+              </label>
+              <div className="inline-actions">
+                <button className="ghost-button" onClick={() => void handlePickDownloadDir()}>
+                  选择目录
+                </button>
+                <button className="ghost-button" onClick={() => void handleSaveDownloadSettings()}>
+                  保存路径
+                </button>
+              </div>
             </div>
           </section>
 
@@ -985,14 +1071,35 @@ function App() {
                           <span className={`pill ${artifact.expired ? 'neutral' : 'success'}`}>
                             {artifact.expired ? 'expired' : 'ready'}
                           </span>
-                          <button className="ghost-button" onClick={() => void handleDownloadArtifact(artifact)} disabled={artifact.expired}>
-                            下载
-                          </button>
+                          {runBundle.artifact_previews.some((preview) => preview.artifact_id === artifact.id) ? (
+                            <span className="pill info">summary.md</span>
+                          ) : (
+                            <button className="ghost-button" onClick={() => void handleDownloadArtifact(artifact)} disabled={artifact.expired}>
+                              下载
+                            </button>
+                          )}
                         </div>
                       </article>
                     ))}
                   </div>
                 </div>
+
+                {activeArtifactPreview ? (
+                  <div className="detail-block">
+                    <h4>Artifact 文档</h4>
+                    <article className="log-card">
+                      <header>
+                        <div className="log-card-title">
+                          <strong className="truncate-1" title={activeArtifactPreview.artifact_name}>
+                            {activeArtifactPreview.artifact_name}
+                          </strong>
+                          <span className="pill info">{activeArtifactPreview.entry_path}</span>
+                        </div>
+                      </header>
+                      <pre className="document-preview">{activeArtifactPreview.content || '文档为空'}</pre>
+                    </article>
+                  </div>
+                ) : null}
 
                 <div className="detail-block">
                   <h4>实时日志</h4>

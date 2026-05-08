@@ -455,6 +455,19 @@ button:disabled {
   gap: 8px;
 }
 
+.download-settings {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.section-title.compact {
+  margin-bottom: 0;
+}
+
 .account-form {
   display: flex;
   flex-direction: column;
@@ -751,6 +764,11 @@ button:disabled {
   white-space: pre;
   overflow: auto;
   max-height: 320px;
+}
+
+.document-preview {
+  white-space: pre-wrap !important;
+  word-break: break-word;
 }
 
 .detail-block {

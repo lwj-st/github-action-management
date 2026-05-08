@@ -1,4 +1,4 @@
-use crate::models::{AccountRecord, AuditEntry, StoredState};
+use crate::models::{AccountRecord, AuditEntry, DownloadSettings, StoredState};
 use chrono::{Duration, Utc};
 use dirs::{data_local_dir, download_dir};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -44,6 +44,37 @@ pub fn downloads_dir() -> PathBuf {
     download_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("github-actions-artifacts")
+}
+
+fn normalize_configured_path(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        if let Some(home_dir) = dirs::home_dir() {
+            return home_dir.join(stripped);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn normalized_setting_path(path: &Option<String>, fallback: PathBuf) -> PathBuf {
+    path.as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_configured_path)
+        .unwrap_or(fallback)
+}
+
+pub fn artifact_download_dir(settings: &DownloadSettings, repo_key: &str) -> PathBuf {
+    normalized_setting_path(&settings.download_dir, downloads_dir()).join(repo_key)
+}
+
+pub fn export_download_dir(settings: &DownloadSettings) -> PathBuf {
+    normalized_setting_path(&settings.download_dir, downloads_dir()).join("reports")
+}
+
+pub fn save_download_settings(state: &mut StoredState, download_dir: Option<String>) {
+    state.download_settings.download_dir = download_dir
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 }
 
 pub fn load_state() -> Result<StoredState, String> {

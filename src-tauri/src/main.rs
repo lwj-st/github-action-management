@@ -8,8 +8,8 @@ use models::*;
 use serde_json::Value;
 use std::fs;
 use storage::{
-    append_audit_entry, delete_token, downloads_dir, load_state, read_token, save_state, store_token,
-    token_status,
+    append_audit_entry, artifact_download_dir, delete_token, export_download_dir, load_state,
+    read_token, save_download_settings, save_state, store_token, token_status,
 };
 
 fn split_repo(repo_full_name: &str) -> Result<(&str, &str), String> {
@@ -26,6 +26,10 @@ fn account_token(state: &StoredState, account_id: &str) -> Result<String, String
     } else {
         Err("Account not found".to_string())
     }
+}
+
+fn repo_storage_key(owner: &str, repo: &str) -> String {
+    format!("{}_{}", owner, repo)
 }
 
 fn to_account_summary(account: &AccountRecord) -> AccountSummary {
@@ -49,6 +53,9 @@ async fn build_run_bundle(
     let run = client.get_run(owner, repo, run_id).await?;
     let jobs = client.get_jobs(owner, repo, run_id).await?;
     let artifacts = client.get_artifacts(owner, repo, run_id).await?;
+    let artifact_previews = client
+        .collect_artifact_previews(owner, repo, &artifacts)
+        .await;
     let collected_logs = client.collect_logs_for_run(owner, repo, &run, &jobs).await;
 
     let log_text = flatten_logs(&jobs, &collected_logs);
@@ -57,6 +64,7 @@ async fn build_run_bundle(
         run,
         jobs,
         artifacts,
+        artifact_previews,
         log_text,
         audit_entries,
     })
@@ -77,7 +85,19 @@ fn bootstrap_app(context: tauri::State<'_, AppContext>) -> Result<BootstrapData,
         selected_account_id: stored.selected_account_id.clone(),
         selected_repo_full_name: stored.selected_repo_full_name.clone(),
         audit_entries: stored.audit_entries.clone(),
+        download_settings: stored.download_settings.clone(),
     })
+}
+
+#[tauri::command]
+fn update_download_settings(
+    context: tauri::State<'_, AppContext>,
+    download_dir: Option<String>,
+) -> Result<DownloadSettings, String> {
+    let mut state = context.state.lock().map_err(|err| err.to_string())?;
+    save_download_settings(&mut state.stored, download_dir);
+    save_state(&state.stored)?;
+    Ok(state.stored.download_settings.clone())
 }
 
 #[tauri::command]
@@ -445,7 +465,10 @@ async fn download_artifact(
     let (owner, repo) = split_repo(&repo_full_name)?;
     let bytes = client.download_artifact_bytes(owner, repo, artifact_id).await?;
 
-    let dir = downloads_dir().join(format!("{}_{}", owner, repo));
+    let dir = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        artifact_download_dir(&state.stored.download_settings, &repo_storage_key(owner, repo))
+    };
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
     let safe_name = artifact_name.replace('/', "-");
     let path = dir.join(format!("{safe_name}-{artifact_id}.zip"));
@@ -492,7 +515,10 @@ async fn export_run_report(
             .collect::<Vec<_>>()
     };
     let bundle = build_run_bundle(&token, &repo_full_name, run_id, audit_entries).await?;
-    let dir = downloads_dir().join("reports");
+    let dir = {
+        let state = context.state.lock().map_err(|err| err.to_string())?;
+        export_download_dir(&state.stored.download_settings)
+    };
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
 
     let path = match format.as_str() {
@@ -551,6 +577,7 @@ fn main() {
             get_accounts,
             set_current_account,
             set_selected_repository,
+            update_download_settings,
             fetch_repositories,
             fetch_workflows,
             fetch_branches,

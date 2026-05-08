@@ -1,4 +1,4 @@
-use crate::models::{Artifact, Branch, Job, Repository, Run, Step, Workflow, WorkflowInput};
+use crate::models::{Artifact, ArtifactPreview, Branch, Job, Repository, Run, Step, Workflow, WorkflowInput};
 use base64::Engine;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
@@ -429,6 +429,36 @@ impl GitHubClient {
         merged
     }
 
+    pub async fn collect_artifact_previews(
+        &self,
+        owner: &str,
+        repo: &str,
+        artifacts: &[Artifact],
+    ) -> Vec<ArtifactPreview> {
+        let mut previews = Vec::new();
+
+        for artifact in artifacts {
+            if artifact.expired {
+                continue;
+            }
+
+            let Ok(bytes) = self.download_artifact_bytes(owner, repo, artifact.id).await else {
+                continue;
+            };
+
+            if let Ok(Some((entry_path, content))) = extract_summary_markdown(&bytes) {
+                previews.push(ArtifactPreview {
+                    artifact_id: artifact.id,
+                    artifact_name: artifact.name.clone(),
+                    entry_path,
+                    content,
+                });
+            }
+        }
+
+        previews
+    }
+
     pub async fn get_artifacts(
         &self,
         owner: &str,
@@ -600,6 +630,42 @@ fn parse_run_logs_archive(bytes: &[u8]) -> Result<Vec<ArchivedLogFile>, String> 
     }
 
     Ok(files)
+}
+
+fn extract_summary_markdown(bytes: &[u8]) -> Result<Option<(String, String)>, String> {
+    let reader = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(reader).map_err(|err| err.to_string())?;
+    let mut candidate_files = Vec::new();
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|err| err.to_string())?;
+        if !entry.is_file() {
+            continue;
+        }
+
+        let path = entry.name().replace('\\', "/");
+        let mut buffer = Vec::new();
+        entry.read_to_end(&mut buffer).map_err(|err| err.to_string())?;
+        let content = String::from_utf8_lossy(&buffer).trim().to_string();
+        candidate_files.push((path, content));
+    }
+
+    if let Some((path, content)) = candidate_files
+        .iter()
+        .find(|(path, _)| path == "output/summary.md" || path.ends_with("/summary.md") || path == "summary.md")
+        .cloned()
+    {
+        return Ok(Some((path, content)));
+    }
+
+    if candidate_files.len() == 1 {
+        let (path, content) = candidate_files.into_iter().next().unwrap();
+        if path.ends_with(".md") {
+            return Ok(Some((path, content)));
+        }
+    }
+
+    Ok(None)
 }
 
 fn choose_better_log(direct: Option<String>, archive: Option<String>) -> Option<String> {
